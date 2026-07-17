@@ -15,8 +15,12 @@ Minimal, fail-closed alpha research lab. Successor to `v7-engine` (frozen, read-
 ## Layout
 
 ```
-salvage/   Code copied from v7-engine. UNAUDITED. Quarantined — see RULES.md.
-lab/       Trusted core. Code enters only after line-by-line audit + tests.
+lab/
+  sim/         Deterministic truth core — defines net_R, labels, outcomes.
+               Reference engine (scalar, hand-verifiable). Nothing else computes money.
+  indicators/  Pure, causal research primitives. Never imported by sim/.
+  tests/       Verification. Every claim is a test.
+salvage/       Code copied from v7-engine. UNAUDITED. Quarantined — see RULES.md.
 ```
 
 ## Status

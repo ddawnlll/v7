@@ -52,3 +52,21 @@ and seen it pass. Claude's summary is not evidence; the command output is.
 ## 12. No process theater
 No ACCP reports, no lock ledgers, no phase ceremonies. Docs are: README, RULES, ROADMAP,
 and code comments that state constraints. Everything else is a test.
+
+## 13. Minimal file surface
+Prefer the fewest files that keep each file independently auditable. A file earns its
+existence by being one coherent audit unit — something a reviewer can read top to bottom
+in one sitting and fully judge on its own. Do not split a concern across files for
+tidiness, and do not merge unrelated concerns to cut the count. Fewer files, each with
+high standalone audit value: this is how hallucination is caught before it ships.
+
+## 14. Deterministic truth core (`lab/sim/`)
+The simulation is the single source of economic truth: it defines `net_R`, labels, and
+outcomes. Nothing else in the repo computes money. Inside `lab/sim/`:
+- No wall-clock, no global RNG, no network, no env reads. Every function is a pure
+  function of its inputs; any randomness is an explicit seed argument.
+- Iterate in sorted order — never rely on dict/set insertion order.
+- Same inputs → byte-identical output hash, on any machine (enforced by a cross-machine
+  determinism test: same result on the operator's box and the remote box).
+- One reference engine (scalar, readable, hand-verifiable) defines truth. Any faster path
+  (vectorized tape, CUDA) is parity-gated against the reference and is never the sole path.

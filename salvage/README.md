@@ -5,9 +5,10 @@ Copied from `v7-engine` @ f1753a8. **UNAUDITED unless listed below. Do not impor
 ## Audit ledger (2026-07-17)
 
 **Moved to `lab/` (audited + tested):**
-- `costs/fees.py` — clean parameter functions
-- `costs/slippage.py` — moved with fix: missing liquidity now raises instead of returning 0 slippage (fail-open)
 - `indicators/` (10 files) — pure, causal; all pass the lookahead test in `lab/tests/test_indicators_causality.py`; `microstructure.dollar_volume` fixed to reject mismatched input lengths
+- `costs/fees.py`, `costs/slippage.py` — the parameter values (fee rates, bps) survived into
+  `lab/sim/costs.py`, but the notional-based API was **rewritten** as fractional costs so the
+  truth core computes net_R with no unit juggling. Old files deleted from lab (superseded).
 
 **Deleted (broken):**
 - `costs/combined.py`, `costs/__init__.py` — imported `r_costs` (never salvaged; broken R-unit conversions)
