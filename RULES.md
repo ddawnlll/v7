@@ -13,7 +13,10 @@ A pipeline that cannot prove its input is real data produces **no artifact**.
 
 ## 3. Size budget
 Core (`lab/`) target ~5,000 lines, hard cap 10,000. At the cap: stop adding, start pruning.
-Files ≤ 400 lines. Functions ≤ 50 lines.
+One file per concern — a whole subsystem lives in one file read in a single pass
+(`lab/sim.py`, `lab/indicators.py`), not scattered across a folder of fragments (see §13).
+Per-file line count is bounded by the core budget above, not a fixed cap; functions stay
+small (≤ ~50 lines) so the single file stays scannable top to bottom.
 
 ## 4. Single authorities
 One dataset builder. One feature engine. One outcome engine. One evaluation harness.

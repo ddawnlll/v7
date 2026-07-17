@@ -14,13 +14,15 @@ Minimal, fail-closed alpha research lab. Successor to `v7-engine` (frozen, read-
 
 ## Layout
 
+One subsystem, one file (RULES §3, §13):
+
 ```
 lab/
-  sim/         Deterministic truth core — defines net_R, labels, outcomes.
-               Reference engine (scalar, hand-verifiable). Nothing else computes money.
-  indicators/  Pure, causal research primitives. Never imported by sim/.
-  tests/       Verification. Every claim is a test.
-salvage/       Code copied from v7-engine. UNAUDITED. Quarantined — see RULES.md.
+  sim.py          Deterministic truth core — defines net_R, labels, outcomes.
+                  Reference engine (scalar, hand-verifiable). Nothing else computes money.
+  indicators.py   Pure, causal research primitives. Never imported by sim.py.
+  tests/          Verification. Every claim is a test.
+salvage/          Code copied from v7-engine. UNAUDITED. Quarantined — see RULES.md.
 ```
 
 ## Status
