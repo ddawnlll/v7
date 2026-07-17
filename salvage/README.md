@@ -1,11 +1,24 @@
 # salvage/ — QUARANTINE
 
-Copied from `v7-engine` @ f1753a8. **UNAUDITED. Do not import.**
+Copied from `v7-engine` @ f1753a8. **UNAUDITED unless listed below. Do not import.**
 
-| Path | Why it was salvaged | Known caveats |
-|------|--------------------|---------------|
-| `lib/data_lake/` | Binance download/archive plumbing — boring, low-risk, tedious to rewrite | audit for silent fallbacks before use |
-| `lib/costs/` | Fee/slippage/funding **parameters and formulas** are market facts | `r_costs.py` deliberately NOT salvaged (broken R-unit conversions) |
-| `lib/indicators/` | Small pure functions | each needs a causality test on import; most are not needed in early phases |
+## Audit ledger (2026-07-17)
+
+**Moved to `lab/` (audited + tested):**
+- `costs/fees.py` — clean parameter functions
+- `costs/slippage.py` — moved with fix: missing liquidity now raises instead of returning 0 slippage (fail-open)
+- `indicators/` (10 files) — pure, causal; all pass the lookahead test in `lab/tests/test_indicators_causality.py`; `microstructure.dollar_volume` fixed to reject mismatched input lengths
+
+**Deleted (broken):**
+- `costs/combined.py`, `costs/__init__.py` — imported `r_costs` (never salvaged; broken R-unit conversions)
+- `indicators/__init__.py` — hardwired to old `lib.*` paths
+
+**Rejected, still quarantined here:**
+
+| Path | Why it stays |
+|------|--------------|
+| `lib/costs/funding_impact.py` | Unit bug: divides quote-currency funding cost by price-unit risk (`atr*stop_mult`) — missing `notional/entry_price` factor. Same disease as `r_costs`. Outcome engine (Phase 1) will do funding in quote currency instead. |
+| `lib/data_lake/sync.py`, `funding.py` | Depend on `lib.market_data.*` (Binance client stack, never salvaged). Phase 0 decides: salvage that stack or rewrite thin. |
+| `lib/data_lake/guard.py` | Sentinel-tag + `sys.exit` approach; Phase 0 integrity gate will be hash-based and exception-based. Kept as reference. |
 
 Exit paths for every file here: audited + tested → moves to `lab/`, or deleted. Nothing lives here permanently.

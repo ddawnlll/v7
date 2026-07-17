@@ -28,9 +28,11 @@ def get_slippage(
     if slippage_pct is not None:
         return notional * (slippage_pct / 100.0)
 
-    # Simple model: slippage scales with trade size relative to liquidity
+    # Fail-closed: unknown liquidity is not zero slippage.
     if avg_liquidity <= 0:
-        return 0.0
+        raise ValueError(
+            "avg_liquidity must be > 0 when slippage_pct is not provided"
+        )
     ratio = notional / avg_liquidity
     # Base slippage 0.01%, scaling linearly with size ratio
     estimated_pct = 0.01 * max(1.0, ratio)

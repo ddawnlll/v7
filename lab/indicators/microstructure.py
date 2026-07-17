@@ -20,14 +20,15 @@ def dollar_volume(prices: Sequence[float], volumes: Sequence[float]) -> list[flo
     Returns:
         List of dollar-volume values, same length as inputs.
     """
-    n = min(len(prices), len(volumes))
-    out_len = max(len(prices), len(volumes))
-    result = np.full(out_len, np.nan, dtype=np.float64)
+    if len(prices) != len(volumes):
+        raise ValueError("prices and volumes must have the same length")
+    n = len(prices)
+    result = np.full(n, np.nan, dtype=np.float64)
     if n > 0:
-        p = np.asarray(prices[:n], dtype=np.float64)
-        v = np.asarray(volumes[:n], dtype=np.float64)
+        p = np.asarray(prices, dtype=np.float64)
+        v = np.asarray(volumes, dtype=np.float64)
         valid = ~(np.isnan(p) | np.isnan(v))
-        result[:n] = np.where(valid, p * v, np.nan)
+        result = np.where(valid, p * v, np.nan)
     return result.tolist()
 
 
