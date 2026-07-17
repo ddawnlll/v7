@@ -50,9 +50,10 @@ INDICATORS = {
     "rsi": lambda o, h, l, c, v: ind.rsi(c),
     "parkinson_vol": lambda o, h, l, c, v: ind.parkinson_vol(h, l),
     "parkinson_spread": lambda o, h, l, c, v: ind.parkinson_spread(h, l),
-    "rolling_parkinson_spread": lambda o, h, l, c, v: ind.rolling_parkinson_spread(h, l),
     "corwin_schultz": lambda o, h, l, c, v: ind.corwin_schultz_spread(h, l),
-    "amihud": lambda o, h, l, c, v: ind.amihud_illiquidity(ind.simple_returns(c), v),
+    "amihud": lambda o, h, l, c, v: ind.amihud_illiquidity(
+        ind.simple_returns(c), ind.dollar_volume(c, v)
+    ),
     "roll_spread": lambda o, h, l, c, v: ind.roll_spread_estimator(c),
     "dollar_volume": lambda o, h, l, c, v: ind.dollar_volume(c, v),
     "typical_price": lambda o, h, l, c, v: ind.typical_price(h, l, c),
@@ -188,8 +189,7 @@ _PERIOD_FUNCS = [
     ("rolling_max", lambda p: ind.rolling_max([1.0] * 20, period=p)),
     ("rolling_min", lambda p: ind.rolling_min([1.0] * 20, period=p)),
     ("rolling_mean", lambda p: ind.rolling_mean([1.0] * 20, period=p)),
-    ("rolling_parkinson_spread", lambda p: ind.rolling_parkinson_spread([2.0] * 20, [1.0] * 20, period=p)),
-    ("amihud", lambda p: ind.amihud_illiquidity([0.01] * 20, [1.0] * 20, period=p)),
+    ("amihud", lambda p: ind.amihud_illiquidity([0.01] * 20, [100.0] * 20, period=p)),
     ("roll_spread", lambda p: ind.roll_spread_estimator([1.0] * 20, period=p)),
     ("rolling_vwap", lambda p: ind.rolling_vwap([2.0] * 20, [1.0] * 20, [1.5] * 20, [1.0] * 20, period=p)),
     ("rolling_apply", lambda p: ind.rolling_apply([1.0] * 20, p, max)),
@@ -262,3 +262,84 @@ def test_log_returns_matches_ratio_form():
     # difference-of-logs must equal log-of-ratio for well-behaved inputs
     out = ind.log_returns([100.0, 110.0])
     assert out[1] == pytest.approx(math.log(110.0 / 100.0))
+
+
+# --- dirty-data policy: NaN out, no silent wrong numbers ---------------------
+
+def test_rsi_nan_bar_does_not_emit_value():
+    # A NaN bar must not be swallowed as "no change" → 100. It resets the run.
+    out = ind.rsi([100.0, 101.0, float("nan"), 102.0, 103.0], period=2)
+    assert all(math.isnan(v) for v in out), out
+
+
+def test_rsi_reseeds_after_dirty_segment():
+    # Clean run long enough after the gap re-seeds and produces a value again.
+    prices = [float("nan"), 100.0, 101.0, 102.0, 103.0, 104.0]
+    out = ind.rsi(prices, period=2)
+    assert not math.isnan(out[-1])  # steady climb after the gap → valid RSI
+
+
+def test_parkinson_vol_invalid_bar_in_window_is_nan():
+    # One invalid bar (low=0) must NOT be averaged as low volatility.
+    out = ind.parkinson_vol([2.0, 2.0], [1.0, 0.0], period=2)
+    assert math.isnan(out[1])
+
+
+def test_atr_invalid_bar_resets_segment():
+    highs = [10.0, 11.0, float("nan"), 11.0, 12.0, 13.0, 12.0]
+    lows = [9.0, 10.0, 9.0, 10.0, 11.0, 12.0, 11.0]
+    closes = [9.5, 10.5, 10.0, 10.5, 11.5, 12.5, 11.5]
+    out = ind.compute_atr(highs, lows, closes, period=2)
+    assert math.isnan(out[2])  # the NaN bar itself
+    assert math.isnan(out[3])  # first bar after reset — mid warmup
+
+
+def test_vwap_invalid_volume_does_not_poison_tail():
+    out = ind.vwap([1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, float("nan"), 1.0])
+    assert out[0] == pytest.approx(1.0)
+    assert math.isnan(out[1])          # the bad bar
+    assert out[2] == pytest.approx(1.0)  # recovered — state preserved, not poisoned
+
+
+def test_rolling_max_min_nan_order_independent():
+    # Old behavior: [nan,1]→nan but [1,nan]→1.0. Now both are NaN.
+    assert math.isnan(ind.rolling_max([float("nan"), 1.0], 2)[1])
+    assert math.isnan(ind.rolling_max([1.0, float("nan")], 2)[1])
+    assert math.isnan(ind.rolling_min([float("nan"), 1.0], 2)[1])
+    assert math.isnan(ind.rolling_min([1.0, float("nan")], 2)[1])
+
+
+def test_candle_rejects_impossible_bar():
+    # high < low, close > high → impossible bar → NaN, not a bogus -0.5 ratio.
+    assert math.isnan(ind.body_ratio([10.0], [5.0], [9.0], [12.0])[0])
+    # valid bar still computes
+    assert ind.body_ratio([10.0], [13.0], [9.0], [12.0])[0] == pytest.approx(0.5)
+
+
+def test_corwin_schultz_bounded_below_2():
+    # Extreme but valid ranges must not overflow; spread stays < 2 (tanh form).
+    h = [100.0, 200.0, 100.0, 300.0, 100.0]
+    l = [1.0, 1.0, 1.0, 1.0, 1.0]
+    out = ind.corwin_schultz_spread(h, l)
+    assert all(math.isnan(v) or v < 2.0 for v in out)
+
+
+# --- structural length validation (multi-series) -----------------------------
+
+_MULTISERIES = [
+    ("compute_atr", lambda: ind.compute_atr([1.0] * 5, [1.0] * 4, [1.0] * 5, period=2)),
+    ("parkinson_vol", lambda: ind.parkinson_vol([2.0] * 5, [1.0] * 4, period=2)),
+    ("parkinson_spread", lambda: ind.parkinson_spread([2.0] * 5, [1.0] * 4)),
+    ("corwin_schultz", lambda: ind.corwin_schultz_spread([2.0] * 5, [1.0] * 4)),
+    ("amihud", lambda: ind.amihud_illiquidity([0.01] * 5, [100.0] * 4, period=2)),
+    ("typical_price", lambda: ind.typical_price([1.0] * 5, [1.0] * 4, [1.0] * 5)),
+    ("vwap", lambda: ind.vwap([1.0] * 5, [1.0] * 5, [1.0] * 5, [1.0] * 4)),
+    ("rolling_vwap", lambda: ind.rolling_vwap([1.0] * 5, [1.0] * 5, [1.0] * 5, [1.0] * 4, period=2)),
+    ("dollar_volume", lambda: ind.dollar_volume([1.0] * 5, [1.0] * 4)),
+]
+
+
+@pytest.mark.parametrize("name,fn", _MULTISERIES, ids=[n for n, _ in _MULTISERIES])
+def test_unequal_lengths_rejected(name, fn):
+    with pytest.raises(ValueError, match="same length"):
+        fn()
