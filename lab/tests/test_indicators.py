@@ -216,6 +216,17 @@ def test_bool_period_rejected(name, fn):
         fn(True)
 
 
+def test_invalid_period_rejected_before_empty_check():
+    # Validation must run before the len==0 early return, so a bad period is
+    # caught even on empty input rather than slipping through.
+    with pytest.raises(ValueError):
+        ind.momentum([], 0)
+    with pytest.raises(ValueError):
+        ind.rolling_mean([], -1)
+    with pytest.raises(TypeError):
+        ind.rsi([], True)
+
+
 # --- rsi edge cases ----------------------------------------------------------
 
 def test_rsi_period_one_rejected():
