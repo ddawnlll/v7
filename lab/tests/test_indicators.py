@@ -174,3 +174,80 @@ def test_roll_spread_alternating_prices():
 def test_dollar_volume_rejects_length_mismatch():
     with pytest.raises(ValueError):
         ind.dollar_volume([1.0, 2.0], [1.0])
+
+
+# --- period validation (causality guard) -------------------------------------
+
+_PERIOD_FUNCS = [
+    ("momentum", lambda p: ind.momentum([1.0, 2.0, 3.0, 4.0], period=p)),
+    ("rate_of_change", lambda p: ind.rate_of_change([1.0, 2.0, 3.0, 4.0], period=p)),
+    ("rsi", lambda p: ind.rsi([1.0] * 20, period=p)),
+    ("compute_atr", lambda p: ind.compute_atr([1.0] * 20, [1.0] * 20, [1.0] * 20, period=p)),
+    ("rolling_std", lambda p: ind.rolling_std([1.0] * 20, period=p)),
+    ("parkinson_vol", lambda p: ind.parkinson_vol([2.0] * 20, [1.0] * 20, period=p)),
+    ("rolling_max", lambda p: ind.rolling_max([1.0] * 20, period=p)),
+    ("rolling_min", lambda p: ind.rolling_min([1.0] * 20, period=p)),
+    ("rolling_mean", lambda p: ind.rolling_mean([1.0] * 20, period=p)),
+    ("rolling_parkinson_spread", lambda p: ind.rolling_parkinson_spread([2.0] * 20, [1.0] * 20, period=p)),
+    ("amihud", lambda p: ind.amihud_illiquidity([0.01] * 20, [1.0] * 20, period=p)),
+    ("roll_spread", lambda p: ind.roll_spread_estimator([1.0] * 20, period=p)),
+    ("rolling_vwap", lambda p: ind.rolling_vwap([2.0] * 20, [1.0] * 20, [1.5] * 20, [1.0] * 20, period=p)),
+    ("rolling_apply", lambda p: ind.rolling_apply([1.0] * 20, p, max)),
+]
+
+
+@pytest.mark.parametrize("name,fn", _PERIOD_FUNCS, ids=[n for n, _ in _PERIOD_FUNCS])
+def test_negative_period_rejected(name, fn):
+    # A negative period would index forward (prices[i+1]) — a lookahead leak.
+    with pytest.raises(ValueError):
+        fn(-1)
+
+
+@pytest.mark.parametrize("name,fn", _PERIOD_FUNCS, ids=[n for n, _ in _PERIOD_FUNCS])
+def test_zero_period_rejected(name, fn):
+    with pytest.raises(ValueError):
+        fn(0)
+
+
+@pytest.mark.parametrize("name,fn", _PERIOD_FUNCS, ids=[n for n, _ in _PERIOD_FUNCS])
+def test_bool_period_rejected(name, fn):
+    # bool is a subclass of int; True/False must not sneak in as period 1/0.
+    with pytest.raises(TypeError):
+        fn(True)
+
+
+# --- rsi edge cases ----------------------------------------------------------
+
+def test_rsi_period_one_rejected():
+    with pytest.raises(ValueError, match="RSI period must be >= 2"):
+        ind.rsi([1.0, 2.0, 3.0], period=1)
+
+
+def test_rsi_flat_market_is_neutral_50():
+    flat = [100.0] * 20
+    out = ind.rsi(flat, period=14)
+    assert out[-1] == pytest.approx(50.0)  # no gains, no losses → neutral, not 100
+
+
+def test_rsi_monotonic_down_is_0():
+    prices = [float(x) for x in range(40, 1, -1)]
+    assert ind.rsi(prices, period=14)[-1] == pytest.approx(0.0)
+
+
+# --- non-finite price policy -------------------------------------------------
+
+def test_returns_reject_non_finite_prices():
+    assert math.isnan(ind.log_returns([100.0, float("inf")])[1])
+    assert math.isnan(ind.simple_returns([100.0, float("inf")])[1])
+    assert math.isnan(ind.log_returns([float("nan"), 100.0])[1])
+
+
+def test_returns_reject_non_positive_prices():
+    assert math.isnan(ind.simple_returns([100.0, -10.0])[1])  # bad data, not -110%
+    assert math.isnan(ind.log_returns([-5.0, 100.0])[1])
+
+
+def test_log_returns_matches_ratio_form():
+    # difference-of-logs must equal log-of-ratio for well-behaved inputs
+    out = ind.log_returns([100.0, 110.0])
+    assert out[1] == pytest.approx(math.log(110.0 / 100.0))

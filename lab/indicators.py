@@ -31,56 +31,89 @@ T = TypeVar("T")
 R = TypeVar("R")
 
 
+def _validate_period(period: int) -> None:
+    """Reject non-positive or non-integer periods.
+
+    Load-bearing for the causality guarantee: a negative period turns
+    ``values[i - period]`` into a forward reference (lookahead), so this is not
+    mere input validation — it is what keeps these primitives causal (RULES §6).
+    ``bool`` is rejected explicitly because ``True``/``False`` are ints in
+    Python and would silently pass as period 1/0.
+    """
+    if isinstance(period, bool) or not isinstance(period, int):
+        raise TypeError(f"period must be an int, got {type(period).__name__}")
+    if period <= 0:
+        raise ValueError(f"period must be > 0, got {period}")
+
+
+def _valid_price(x: float) -> bool:
+    """A usable price is finite and strictly positive. Consistent policy across
+    all return primitives (an inf or a non-positive price is bad data)."""
+    return math.isfinite(x) and x > 0.0
+
+
 # --- returns -----------------------------------------------------------------
 
 def log_returns(prices: Sequence[float]) -> list[float]:
-    """Log returns: ln(P_t / P_{t-1}). First element is NaN (no prior price)."""
+    """Log returns: ln(P_t) - ln(P_{t-1}). First element is NaN.
+
+    Uses the difference of logs rather than log of the ratio: mathematically
+    identical but avoids forming an intermediate ratio that could over/underflow
+    at extreme magnitudes. NaN where either price is non-finite or non-positive.
+    """
     n = len(prices)
     if n < 2:
         return [float("nan")] * n
     result: list[float] = [float("nan")] * n
     for i in range(1, n):
-        if prices[i - 1] > 0 and prices[i] > 0:
-            result[i] = math.log(prices[i] / prices[i - 1])
-        else:
-            result[i] = float("nan")
+        if _valid_price(prices[i - 1]) and _valid_price(prices[i]):
+            result[i] = math.log(prices[i]) - math.log(prices[i - 1])
     return result
 
 
 def simple_returns(prices: Sequence[float]) -> list[float]:
-    """Simple returns: (P_t - P_{t-1}) / P_{t-1}. First element is NaN."""
+    """Simple returns: (P_t - P_{t-1}) / P_{t-1}. First element is NaN.
+
+    Same price policy as log_returns (both prices finite and positive) so the
+    two primitives agree on what counts as bad data.
+    """
     n = len(prices)
     if n < 2:
         return [float("nan")] * n
     result: list[float] = [float("nan")] * n
     for i in range(1, n):
-        if prices[i - 1] > 0:
+        if _valid_price(prices[i - 1]) and _valid_price(prices[i]):
             result[i] = (prices[i] - prices[i - 1]) / prices[i - 1]
-        else:
-            result[i] = float("nan")
     return result
 
 
 # --- momentum ----------------------------------------------------------------
 
 def momentum(prices: Sequence[float], period: int = 10) -> list[float]:
-    """Momentum: (P_t - P_{t-period}) / P_{t-period}.
+    """Fractional rate of change: (P_t - P_{t-period}) / P_{t-period}.
 
-    First `period` values are NaN. Zero/negative base price returns NaN.
+    Despite the classical name, this is a *fractional* momentum (a ratio), not
+    the absolute price difference P_t - P_{t-period}. `rate_of_change` below is
+    the identical signal scaled by 100 — do NOT treat the two as independent
+    features; they are perfectly correlated.
+
+    First `period` values are NaN. Non-finite/non-positive prices yield NaN.
     """
+    _validate_period(period)
     n = len(prices)
     if n == 0:
         return []
     result: list[float] = [float("nan")] * n
     for i in range(period, n):
-        if prices[i - period] <= 0:
-            continue
-        result[i] = (prices[i] - prices[i - period]) / prices[i - period]
+        base, curr = prices[i - period], prices[i]
+        if _valid_price(base) and _valid_price(curr):
+            result[i] = (curr - base) / base
     return result
 
 
 def rate_of_change(prices: Sequence[float], period: int = 10) -> list[float]:
-    """Rate of Change: momentum * 100. First `period` values are NaN."""
+    """Rate of Change: momentum * 100. Same signal as `momentum`, percentage
+    units — not an independent feature. First `period` values are NaN."""
     raw = momentum(prices, period=period)
     return [v * 100 if v == v else v for v in raw]  # v == v is False for NaN
 
@@ -90,13 +123,17 @@ def rate_of_change(prices: Sequence[float], period: int = 10) -> list[float]:
 def rsi(prices: Sequence[float], period: int = 14) -> list[float]:
     """Relative Strength Index using Wilder's smoothed EMA.
 
-    First `period` values are NaN. Valid outputs are in [0, 100].
+    First `period` values are NaN (period changes need period+1 prices). Valid
+    outputs are in [0, 100]. A flat window (no gains and no losses) is 50 —
+    neutral — not 100. period must be >= 2; period 1 is rejected rather than
+    silently returning all-NaN.
     """
+    _validate_period(period)
+    if period < 2:
+        raise ValueError(f"RSI period must be >= 2, got {period}")
     n = len(prices)
     if n == 0:
         return []
-    if period == 1:
-        return [float("nan")] * n
     result: list[float] = [float("nan")] * n
     if n < period + 1:
         return result
@@ -104,7 +141,7 @@ def rsi(prices: Sequence[float], period: int = 14) -> list[float]:
     gains: list[float] = [0.0] * n
     losses: list[float] = [0.0] * n
     for i in range(1, n):
-        if prices[i - 1] > 0 and prices[i] > 0:
+        if _valid_price(prices[i - 1]) and _valid_price(prices[i]):
             delta = prices[i] - prices[i - 1]
             if delta > 0:
                 gains[i] = delta
@@ -120,8 +157,12 @@ def rsi(prices: Sequence[float], period: int = 14) -> list[float]:
             avg_loss = (avg_loss * (period - 1) + losses[i]) / period
         if prices[i] <= 0:
             continue
-        if avg_loss == 0.0:
+        if avg_gain == 0.0 and avg_loss == 0.0:
+            result[i] = 50.0
+        elif avg_loss == 0.0:
             result[i] = 100.0
+        elif avg_gain == 0.0:
+            result[i] = 0.0
         else:
             rs = avg_gain / avg_loss
             result[i] = 100.0 - (100.0 / (1.0 + rs))
@@ -141,6 +182,7 @@ def compute_atr(
     First `period` values are NaN. atr[period] is the simple average of the
     first `period` true ranges; later values use Wilder's smoothed EMA.
     """
+    _validate_period(period)
     n = len(highs)
     if n < period + 1:
         return [float("nan")] * n
@@ -163,6 +205,7 @@ def compute_atr(
 
 def rolling_std(values: Sequence[float], period: int = 20) -> list[float]:
     """Rolling population std (ddof=0). First `period-1` values are NaN."""
+    _validate_period(period)
     n = len(values)
     result: list[float] = [float("nan")] * n
     for i in range(period - 1, n):
@@ -182,6 +225,7 @@ def parkinson_vol(
 
     First `period-1` values are NaN.
     """
+    _validate_period(period)
     n = len(highs)
     result: list[float] = [float("nan")] * n
     c = 1.0 / (4.0 * math.log(2.0))
@@ -203,6 +247,7 @@ def rolling_apply(
     min_periods: int | None = None,
 ) -> list[R | None]:
     """Apply `func` to each rolling window. Before min_periods, returns None."""
+    _validate_period(window)
     if min_periods is None:
         min_periods = window
     n = len(values)
@@ -217,6 +262,7 @@ def rolling_apply(
 
 def rolling_max(values: Sequence[float], period: int = 20) -> list[float]:
     """Rolling max. First `period-1` values NaN. period=1 returns values."""
+    _validate_period(period)
     n = len(values)
     if n == 0:
         return []
@@ -230,6 +276,7 @@ def rolling_max(values: Sequence[float], period: int = 20) -> list[float]:
 
 def rolling_min(values: Sequence[float], period: int = 20) -> list[float]:
     """Rolling min. First `period-1` values NaN. period=1 returns values."""
+    _validate_period(period)
     n = len(values)
     if n == 0:
         return []
@@ -243,6 +290,7 @@ def rolling_min(values: Sequence[float], period: int = 20) -> list[float]:
 
 def rolling_mean(values: Sequence[float], period: int = 20) -> list[float]:
     """Rolling mean. First `period-1` values NaN. period=1 returns values."""
+    _validate_period(period)
     n = len(values)
     if n == 0:
         return []
@@ -343,6 +391,7 @@ def rolling_parkinson_spread(
 
     First `period-1` values are NaN.
     """
+    _validate_period(period)
     n = len(highs)
     result: list[float] = [float("nan")] * n
     c = 1.0 / (4.0 * math.log(2.0))
@@ -405,9 +454,10 @@ def amihud_illiquidity(
 
     Higher = less liquid. First `period-1` values NaN; zero-volume windows NaN.
     """
+    _validate_period(period)
     n = len(returns)
     result = np.full(n, np.nan, dtype=np.float64)
-    if n < period or period < 1:
+    if n < period:
         return result.tolist()
     r = np.asarray(returns, dtype=np.float64)
     v = np.asarray(volumes, dtype=np.float64)
@@ -430,6 +480,7 @@ def roll_spread_estimator(prices: Sequence[float], period: int = 20) -> list[flo
 
     S = 2 * sqrt(max(0, -cov(dp_t, dp_{t-1}))). First `period` values are NaN.
     """
+    _validate_period(period)
     n = len(prices)
     if n < period + 1:
         return [float("nan")] * n
@@ -504,6 +555,7 @@ def rolling_vwap(
     period: int = 20,
 ) -> list[float]:
     """Rolling VWAP over a fixed window. First `period-1` values are NaN."""
+    _validate_period(period)
     n = len(highs)
     result: list[float] = [float("nan")] * n
     for i in range(period - 1, n):
