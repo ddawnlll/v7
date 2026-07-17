@@ -167,9 +167,11 @@ def test_amihud_constant_ratio():
 
 
 def test_roll_spread_alternating_prices():
-    # Price alternates 100/101 → deltas ±1 → serial cov = -1 → S = 2
+    # Price alternates 100/101 → deltas ±1 → serial cov → -1 → S → 2.
+    # Strict window uses period-1 = 19 pairs, so the finite-sample estimate sits
+    # just under the theoretical limit of 2 (~1.997), not exactly 2.
     prices = [100.0 + (i % 2) for i in range(30)]
-    assert ind.roll_spread_estimator(prices, period=20)[-1] == pytest.approx(2.0)
+    assert ind.roll_spread_estimator(prices, period=20)[-1] == pytest.approx(2.0, abs=0.01)
 
 
 def test_dollar_volume_rejects_length_mismatch():
@@ -298,7 +300,73 @@ def test_vwap_invalid_volume_does_not_poison_tail():
     out = ind.vwap([1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0], [1.0, float("nan"), 1.0])
     assert out[0] == pytest.approx(1.0)
     assert math.isnan(out[1])          # the bad bar
-    assert out[2] == pytest.approx(1.0)  # recovered — state preserved, not poisoned
+    assert out[2] == pytest.approx(1.0)  # recovered — segment reset, not poisoned
+
+
+def test_vwap_segment_reset_restarts_from_next_clean_bar():
+    # After a dirty bar the accumulator resets: the third bar's VWAP is its own
+    # typical price (100), not a blend with the pre-gap segment (~55).
+    highs = [10.0, float("nan"), 100.0]
+    lows = [10.0, float("nan"), 100.0]
+    closes = [10.0, float("nan"), 100.0]
+    out = ind.vwap(highs, lows, closes, [1.0, 1.0, 1.0])
+    assert out[0] == pytest.approx(10.0)
+    assert math.isnan(out[1])
+    assert out[2] == pytest.approx(100.0)
+
+
+def test_hlc_functions_reject_close_outside_range():
+    # close=100 with high=10 is impossible → NaN, not a computed number.
+    assert math.isnan(ind.typical_price([10.0], [9.0], [100.0])[0])
+    assert math.isnan(ind.vwap([10.0], [9.0], [100.0], [1.0])[0])
+    assert math.isnan(ind.rolling_vwap([10.0, 10.0], [9.0, 9.0], [9.5, 100.0], [1.0, 1.0], period=2)[1])
+
+
+def test_atr_rejects_close_outside_range():
+    # Second bar has close=100 with high=10 — impossible; must not yield ATR.
+    out = ind.compute_atr([10.0, 10.0, 10.0], [9.0, 9.0, 9.0], [9.5, 100.0, 9.5], period=1)
+    assert math.isnan(out[1])
+
+
+def test_rolling_max_min_reject_inf():
+    assert math.isnan(ind.rolling_max([1.0, float("inf")], 2)[1])
+    assert math.isnan(ind.rolling_min([1.0, float("-inf")], 2)[1])
+
+
+def test_parkinson_spread_rejects_non_positive_price():
+    assert math.isnan(ind.parkinson_spread([-1.0], [-2.0])[0])
+    assert math.isnan(ind.parkinson_spread([0.0], [0.0])[0])
+
+
+def test_dollar_volume_rejects_non_positive():
+    out = ind.dollar_volume([-10.0, 10.0], [5.0, -5.0])
+    assert math.isnan(out[0])  # negative price
+    assert math.isnan(out[1])  # negative volume
+
+
+def test_amihud_strict_window_any_invalid_is_nan():
+    returns = [0.01] * 20
+    dv = [100.0] * 20
+    dv[5] = 0.0  # one invalid observation inside the first full window
+    out = ind.amihud_illiquidity(returns, dv, period=20)
+    assert math.isnan(out[19])  # window [0..19] contains the invalid bar
+
+
+def test_roll_spread_strict_window_any_invalid_is_nan():
+    prices = [100.0 + (i % 2) for i in range(30)]
+    prices[10] = float("nan")
+    out = ind.roll_spread_estimator(prices, period=20)
+    # any window covering index 10 must be NaN
+    assert math.isnan(out[20])
+
+
+def test_rolling_apply_validates_min_periods():
+    with pytest.raises(ValueError):
+        ind.rolling_apply([1.0] * 5, 3, max, min_periods=0)
+    with pytest.raises(ValueError, match="cannot exceed"):
+        ind.rolling_apply([1.0] * 5, 3, max, min_periods=4)
+    with pytest.raises(TypeError):
+        ind.rolling_apply([1.0] * 5, 3, max, min_periods=True)
 
 
 def test_rolling_max_min_nan_order_independent():

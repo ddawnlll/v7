@@ -13,9 +13,10 @@ Data-validity contract (fixed):
 - Dirty cell data yields NaN, never a silently wrong number: a non-finite value,
   a non-positive price, or an impossible OHLC bar (not low <= open,close <= high)
   produces NaN at the affected output positions; clean regions stay valid.
-- Stateful indicators (rsi, atr, cumulative vwap) segment-reset on dirty data:
-  they discard their running state and re-seed after `period` consecutive clean
-  observations, so one bad bar does not permanently poison the rest of the series.
+- Stateful indicators segment-reset on dirty data: rsi and atr discard their
+  running averages and re-seed after `period` consecutive clean observations;
+  cumulative vwap discards its running totals and restarts from the next clean
+  bar. One bad bar never permanently poisons the rest of the series.
 
 Contents:
   returns        log_returns, simple_returns
@@ -84,6 +85,14 @@ def _valid_ohlc(o: float, h: float, l: float, c: float) -> bool:
     if l <= 0.0:
         return False
     return l <= min(o, c) and max(o, c) <= h
+
+
+def _valid_hlc(h: float, l: float, c: float) -> bool:
+    """A usable HLC bar (no open): finite, positive, and 0 < low <= close <= high.
+    Rejects impossible bars where close falls outside the [low, high] range."""
+    if not (math.isfinite(h) and math.isfinite(l) and math.isfinite(c)):
+        return False
+    return 0.0 < l <= c <= h
 
 
 # --- returns -----------------------------------------------------------------
@@ -244,10 +253,9 @@ def compute_atr(
 
     for i in range(1, n):
         hi, lo, cl, prev_cl = highs[i], lows[i], closes[i], closes[i - 1]
-        if not (
-            _valid_price(hi) and _valid_price(lo) and _valid_price(cl)
-            and _valid_price(prev_cl) and hi >= lo
-        ):
+        # This bar must be a valid HLC bar; the prior close (feeding true range)
+        # must itself be a usable price. A dirty prior bar reset the run already.
+        if not (_valid_hlc(hi, lo, cl) and _valid_price(prev_cl)):
             valid_run = 0
             seed_tr.clear()
             atr = _NAN
@@ -324,10 +332,20 @@ def rolling_apply(
     min_periods: int | None = None,
 ) -> list[R | None]:
     """Apply `func` to each rolling window. Before min_periods, returns None.
-    Missing-data policy is delegated to `func` (this is a generic combinator)."""
+
+    Generic combinator: missing-data policy is delegated to `func`. The module's
+    purity/causality guarantee holds only if `func` is itself pure and causal —
+    that is the caller's precondition, not something this function can enforce.
+    """
     _validate_period(window)
     if min_periods is None:
         min_periods = window
+    else:
+        _validate_period(min_periods)
+        if min_periods > window:
+            raise ValueError(
+                f"min_periods ({min_periods}) cannot exceed window ({window})"
+            )
     n = len(values)
     result: list[R | None] = [None] * n
     for i in range(n):
@@ -339,37 +357,29 @@ def rolling_apply(
 
 
 def rolling_max(values: Sequence[float], period: int = 20) -> list[float]:
-    """Rolling max. First `period-1` values NaN. A window with any NaN yields
-    NaN — deterministic regardless of NaN position (plain max is order-dependent
-    on NaN). period=1 returns values unchanged."""
+    """Rolling max. First `period-1` values NaN. A window with any non-finite
+    value (NaN or inf) yields NaN — deterministic regardless of position (plain
+    max is order-dependent on NaN, and would let inf through)."""
     _validate_period(period)
     n = len(values)
-    if n == 0:
-        return []
-    if period == 1:
-        return list(values)
     result: list[float] = [_NAN] * n
     for i in range(period - 1, n):
         window = values[i - period + 1 : i + 1]
-        if any(math.isnan(x) for x in window):
+        if any(not math.isfinite(x) for x in window):
             continue
         result[i] = max(window)
     return result
 
 
 def rolling_min(values: Sequence[float], period: int = 20) -> list[float]:
-    """Rolling min. First `period-1` values NaN. A window with any NaN yields
-    NaN (deterministic). period=1 returns values unchanged."""
+    """Rolling min. First `period-1` values NaN. A window with any non-finite
+    value (NaN or inf) yields NaN (deterministic)."""
     _validate_period(period)
     n = len(values)
-    if n == 0:
-        return []
-    if period == 1:
-        return list(values)
     result: list[float] = [_NAN] * n
     for i in range(period - 1, n):
         window = values[i - period + 1 : i + 1]
-        if any(math.isnan(x) for x in window):
+        if any(not math.isfinite(x) for x in window):
             continue
         result[i] = min(window)
     return result
@@ -377,13 +387,9 @@ def rolling_min(values: Sequence[float], period: int = 20) -> list[float]:
 
 def rolling_mean(values: Sequence[float], period: int = 20) -> list[float]:
     """Rolling mean. First `period-1` values NaN. A window with any non-finite
-    value yields NaN. period=1 returns values unchanged."""
+    value yields NaN."""
     _validate_period(period)
     n = len(values)
-    if n == 0:
-        return []
-    if period == 1:
-        return list(values)
     result: list[float] = [_NAN] * n
     for i in range(period - 1, n):
         window = values[i - period + 1 : i + 1]
@@ -466,7 +472,7 @@ def parkinson_spread(highs: Sequence[float], lows: Sequence[float]) -> list[floa
     inv_4ln2 = 1.0 / (4.0 * math.log(2.0))
     for i in range(n):
         hi, lo = highs[i], lows[i]
-        if not (math.isfinite(hi) and math.isfinite(lo) and hi >= lo):
+        if not (_valid_price(hi) and _valid_price(lo) and hi >= lo):
             continue
         diff = hi - lo
         result[i] = math.sqrt(diff * diff * inv_4ln2)
@@ -506,14 +512,14 @@ def corwin_schultz_spread(highs: Sequence[float], lows: Sequence[float]) -> list
 
 def dollar_volume(prices: Sequence[float], volumes: Sequence[float]) -> list[float]:
     """Dollar volume per bar: price * volume. Raises on length mismatch; NaN
-    where either input is non-finite."""
+    where price is not positive or volume is negative or either is non-finite."""
     _validate_equal_lengths(prices, volumes)
     n = len(prices)
     if n == 0:
         return []
     p = np.asarray(prices, dtype=np.float64)
     v = np.asarray(volumes, dtype=np.float64)
-    valid = np.isfinite(p) & np.isfinite(v)
+    valid = np.isfinite(p) & np.isfinite(v) & (p > 0.0) & (v >= 0.0)
     return np.where(valid, p * v, np.nan).tolist()
 
 
@@ -527,7 +533,9 @@ def amihud_illiquidity(
     The denominator must be DOLLAR volume (price * base volume), not raw
     base-asset volume — otherwise the ratio is not comparable across symbols.
     Build it with `dollar_volume(...)`. Higher = less liquid. First `period-1`
-    values NaN; windows with no valid observation are NaN.
+    values NaN. Strict window: if any observation in the window is invalid
+    (non-finite return, non-positive dollar volume), the result is NaN — the
+    sample size is never silently shrunk.
     """
     _validate_period(period)
     _validate_equal_lengths(returns, dollar_volumes)
@@ -538,16 +546,15 @@ def amihud_illiquidity(
     r = np.asarray(returns, dtype=np.float64)
     dv = np.asarray(dollar_volumes, dtype=np.float64)
     valid = (dv > 0) & np.isfinite(r) & np.isfinite(dv)
-    safe_dv = np.where(valid, dv, 1.0)
-    contrib = np.where(valid, np.abs(r) / safe_dv, 0.0)
+    contrib = np.where(valid, np.abs(r) / np.where(valid, dv, 1.0), 0.0)
     csum = np.cumsum(np.insert(contrib, 0, 0.0))
-    ccount = np.cumsum(np.insert(valid.astype(np.float64), 0, 0.0))
+    vcount = np.cumsum(np.insert(valid.astype(np.float64), 0, 0.0))
     idx = np.arange(period - 1, n)
     start = idx - period + 1
     total = csum[idx + 1] - csum[start]
-    count = ccount[idx + 1] - ccount[start]
-    ok = count > 0
-    result[idx[ok]] = total[ok] / count[ok]
+    n_valid = vcount[idx + 1] - vcount[start]
+    all_valid = n_valid == period  # strict: whole window must be clean
+    result[idx[all_valid]] = total[all_valid] / period
     return result.tolist()
 
 
@@ -555,41 +562,29 @@ def roll_spread_estimator(prices: Sequence[float], period: int = 20) -> list[flo
     """Roll (1984) spread from serial covariance of price changes.
 
     S = 2 * sqrt(max(0, -cov(dp_t, dp_{t-1}))). First `period` values are NaN.
-    Non-finite prices are excluded from the covariance window.
+    Strict window: each estimate uses the `period+1` prices prices[i-period..i];
+    if any is invalid the result is NaN, so every estimate uses the full,
+    equal-size sample of `period` deltas (no first-window off-by-one, no silently
+    shrunk covariance).
     """
     _validate_period(period)
     n = len(prices)
-    if n < period + 1:
-        return [_NAN] * n
-
-    deltas: list[float] = [_NAN] * n
-    for i in range(1, n):
-        if math.isfinite(prices[i]) and math.isfinite(prices[i - 1]):
-            deltas[i] = prices[i] - prices[i - 1]
-
     result: list[float] = [_NAN] * n
+    if n < period + 1:
+        return result
+
     for i in range(period, n):
-        start = i - period + 1
-        count = 0
-        sum_d = sum_d_lag = 0.0
-        for j in range(start, i + 1):
-            if not math.isnan(deltas[j]) and not math.isnan(deltas[j - 1]):
-                sum_d += deltas[j]
-                sum_d_lag += deltas[j - 1]
-                count += 1
-        if count < 2:
+        window = prices[i - period : i + 1]  # period + 1 prices
+        if any(not _valid_price(x) for x in window):
             continue
-        mean_d = sum_d / count
-        mean_d_lag = sum_d_lag / count
-        cov = 0.0
-        valid = 0
-        for j in range(start, i + 1):
-            if not math.isnan(deltas[j]) and not math.isnan(deltas[j - 1]):
-                cov += (deltas[j] - mean_d) * (deltas[j - 1] - mean_d_lag)
-                valid += 1
-        if valid >= 2:
-            cov /= valid
-            result[i] = 2.0 * math.sqrt(-cov) if cov < 0 else 0.0
+        deltas = [window[k] - window[k - 1] for k in range(1, len(window))]  # period
+        lead = deltas[1:]   # dp_t
+        lag = deltas[:-1]   # dp_{t-1}
+        m = len(lead)       # period - 1 pairs
+        mean_lead = sum(lead) / m
+        mean_lag = sum(lag) / m
+        cov = sum((a - mean_lead) * (b - mean_lag) for a, b in zip(lead, lag)) / m
+        result[i] = 2.0 * math.sqrt(-cov) if cov < 0 else 0.0
     return result
 
 
@@ -600,12 +595,12 @@ def typical_price(
     lows: Sequence[float],
     closes: Sequence[float],
 ) -> list[float]:
-    """Typical price: (high + low + close) / 3. NaN where any input is non-finite."""
+    """Typical price: (high + low + close) / 3. NaN for an invalid HLC bar."""
     _validate_equal_lengths(highs, lows, closes)
     n = len(highs)
     result: list[float] = [_NAN] * n
     for i in range(n):
-        if math.isfinite(highs[i]) and math.isfinite(lows[i]) and math.isfinite(closes[i]):
+        if _valid_hlc(highs[i], lows[i], closes[i]):
             result[i] = (highs[i] + lows[i] + closes[i]) / 3.0
     return result
 
@@ -616,19 +611,18 @@ def vwap(
     closes: Sequence[float],
     volumes: Sequence[float],
 ) -> list[float]:
-    """Cumulative VWAP from the start. An invalid bar (non-finite price/volume or
-    negative volume) is skipped: its output is NaN but the cumulative state is
-    preserved, so one bad bar does not poison every later value."""
+    """Cumulative VWAP from the start. An invalid bar (bad HLC, non-finite or
+    negative volume) segment-resets the accumulator: its output is NaN and the
+    running totals are discarded, so VWAP restarts fresh from the next clean bar
+    (consistent with rsi/atr reset; matches the module data-validity contract)."""
     _validate_equal_lengths(highs, lows, closes, volumes)
     n = len(highs)
     result: list[float] = [_NAN] * n
     cum_pv = cum_v = 0.0
     for i in range(n):
         hi, lo, cl, vol = highs[i], lows[i], closes[i], volumes[i]
-        if not (
-            math.isfinite(hi) and math.isfinite(lo) and math.isfinite(cl)
-            and math.isfinite(vol) and vol >= 0.0
-        ):
+        if not (_valid_hlc(hi, lo, cl) and math.isfinite(vol) and vol >= 0.0):
+            cum_pv = cum_v = 0.0  # segment reset
             continue
         tp = (hi + lo + cl) / 3.0
         cum_pv += tp * vol
@@ -656,10 +650,7 @@ def rolling_vwap(
         ok = True
         for j in range(i - period + 1, i + 1):
             hi, lo, cl, vol = highs[j], lows[j], closes[j], volumes[j]
-            if not (
-                math.isfinite(hi) and math.isfinite(lo) and math.isfinite(cl)
-                and math.isfinite(vol) and vol >= 0.0
-            ):
+            if not (_valid_hlc(hi, lo, cl) and math.isfinite(vol) and vol >= 0.0):
                 ok = False
                 break
             tp = (hi + lo + cl) / 3.0
