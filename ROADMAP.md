@@ -1,30 +1,406 @@
 # ROADMAP
 
-Each phase has one exit criterion. A phase is done when its exit command passes on the remote box — not before.
+This roadmap is evidence-gated.
 
-## Phase 0 — Bootstrap (current)
-Data integrity gate + salvage audit queue (`data_lake`, cost params first).
-**Exit:** one verified dataset snapshot (monotonic, gap-flagged, deduped, hashed) built fail-closed from raw parquet.
+It does not promise a model architecture, trading strategy, accelerator, market,
+timeframe, or profitable result in advance. Each phase answers one question.
+Only the next phase may be implemented. Later phases remain locked until their
+entry condition is satisfied.
 
-## Phase 1 — Outcome engine
-Reference engine `lab/sim.py` exists (barrier walk, fees/slippage/funding, `net_R`, MAE/MFE,
-exit reason). Hardening and exit verification pending: gap semantics, same-bar semantics,
-cost truth, golden trades, cross-machine determinism.
-**Exit:** parity vs frozen v7-engine simulation on N random trades within tolerance, plus 20 trades hand-verified against candles.
+A phase ends with one of three verdicts:
 
-## Phase 2 — Evaluation harness + baselines
-Event-end purged splits, frozen holdout, negative controls, rank IC / calibration / expectancy metrics.
-Baseline ladder: random, always-NO_TRADE, linear, XGBoost.
-**Exit:** shuffled-label run reports no edge; baselines reproduce from `dataset_hash + config_hash + seed`.
+* **PASS** — the claim is supported; the next phase unlocks.
+* **HOLD** — evidence or correctness is incomplete; remain in the phase.
+* **FAIL** — the tested assumption is rejected; preserve the validated core and
+  revise only the failed assumption.
 
-## Phase 3 — First hypotheses
-Simple economic hypotheses (cross-sectional momentum/reversal, funding/carry, flow) as rules first, models second.
-**Exit:** each hypothesis has an OOS verdict with costs — including "no edge", which counts as a result.
+A poor research result is never permission to rewrite a validated lower layer.
 
-## Phase 4 — Neural sequence model
-Small temporal encoder, multi-task outcome heads. Only if Phase 2/3 infrastructure is trusted.
-**Exit:** beats the baseline ladder OOS on the same data, splits, and costs — or is rejected.
+---
 
-## Phase 5 — Policy / execution (locked)
-Position sizing, portfolio replay, offline RL, live execution.
-**Unlocks only** after a Phase 3/4 edge survives multiple untouched OOS periods and 2× cost stress.
+## Current status
+
+**NOW:** Simulation truth-core hardening and lock verification.
+
+**NEXT:** One verified market-data snapshot.
+
+**LOCKED:** Research hypotheses, models, execution policies, RL, live trading,
+and hardware acceleration.
+
+---
+
+## Phase 0 — Indicator authority
+
+### Question
+
+Do the research primitives implement their declared mathematical and causal
+contracts?
+
+### Required evidence
+
+* Hand-computed golden values
+* Future-append causality
+* Dirty-data and recovery behavior
+* Finite-or-NaN output contract
+* Numerical overflow and extreme-input tests
+* Structural input failures raise deterministically
+* Full test suite passes from a clean checkout
+
+### Exit
+
+A verified commit SHA is recorded as the indicator authority.
+
+After exit, this phase is reopened only for a reproducible correctness defect,
+not because a later strategy performs poorly.
+
+---
+
+## Phase 1 — Simulation authority
+
+### Question
+
+Can one trade be converted into an economically correct, deterministic and
+hand-verifiable outcome?
+
+### Scope
+
+* Entry-fill convention
+* Stop, target and timeout semantics
+* Open-gap behavior
+* Same-bar ambiguity
+* Directional slippage
+* Entry and exit fees
+* Funding events
+* MAE and MFE semantics
+* Gross return, execution return, net return and net_R
+* Event-end causality
+* Canonical outcome serialization
+
+### Required evidence
+
+* Hand-computed golden trades
+* LONG/SHORT mirror tests
+* Stop/target/gap/timeout cases
+* Cost decomposition identities
+* Post-exit bar mutation invariance
+* Post-exit funding-value mutation invariance
+* Malformed consumed inputs fail closed
+* All economic outputs remain finite
+* Frozen outcome hashes match on local and remote machines
+* Full suite passes from the same clean commit
+
+### Exit
+
+A verified commit SHA is recorded as the simulation authority.
+
+Nothing else in the repository may calculate money, labels or trade outcomes.
+
+---
+
+## Phase 2 — Verified data snapshot
+
+### Question
+
+Can one bounded market-data snapshot be reproduced and trusted as real input?
+
+### Scope
+
+The smallest snapshot sufficient to exercise the truth core.
+
+The market, instrument, timeframe and date range are selected at the start of
+this phase and recorded as data choices, not assumed permanently by the roadmap.
+
+### Required evidence
+
+* Source identity and retrieval parameters
+* Completed-candle filtering
+* Timestamp ordering
+* Duplicate detection
+* Gap detection and explicit gap representation
+* OHLC consistency
+* Instrument metadata and units
+* Dataset hash
+* Byte-identical or semantically identical rebuild according to the declared
+  serialization contract
+
+### Exit
+
+One immutable dataset snapshot and its build command are recorded.
+
+No multi-market expansion occurs in this phase.
+
+---
+
+## Phase 3 — Outcome observation
+
+### Question
+
+What outcome structures actually exist in the verified data before prediction
+is attempted?
+
+### Work
+
+Use the locked simulation authority to measure observable outcome properties,
+such as:
+
+* Favorable and adverse excursion
+* Time to outcome
+* Target-before-stop base rates
+* Cost sensitivity
+* Ambiguous-bar frequency
+* Coverage under candidate outcome definitions
+
+No model is trained and no profitable geometry is presumed.
+
+### Exit
+
+A bounded set of empirical observations is produced from development data.
+
+If no economically meaningful outcome definition is found, the phase returns
+FAIL. The indicator, simulation and data authorities remain unchanged.
+
+---
+
+## Phase 4 — Outcome contract
+
+### Question
+
+Can one outcome definition be frozen without using validation or holdout
+performance to choose it?
+
+### Required artifact
+
+One versioned outcome specification defining:
+
+* Decision timestamp
+* Entry convention
+* Risk definition
+* Exit rules
+* Maximum horizon
+* Outcome end timestamp
+* Cost assumptions
+* Invalid and ambiguous cases
+
+### Exit
+
+Golden labels generated by the outcome engine match hand-verified trades.
+
+The outcome definition is frozen before predictive model selection begins.
+
+---
+
+## Phase 5 — Evaluation authority
+
+### Question
+
+Can the research pipeline distinguish signal from noise without leaking future
+information?
+
+### Required evidence
+
+* Event-end purged splits
+* Untouched frozen holdout
+* Shuffled-label negative control
+* Always-abstain baseline
+* Random predictor
+* Simple linear baseline
+* Tree baseline
+* Deterministic reproduction from dataset hash, config hash and seed
+* Per-trade outcomes reconcile exactly with aggregate metrics
+
+### Exit
+
+Noise produces no edge and all baseline results are reproducible.
+
+If shuffled labels produce edge, every result from the evaluator is void until
+the defect is found.
+
+---
+
+## Phase 6 — First falsifiable hypothesis
+
+### Question
+
+Does one explicitly stated market hypothesis improve outcome selection outside
+the data used to formulate it?
+
+### Rules
+
+* One hypothesis at a time
+* A small, declared feature surface
+* No architecture search
+* No hidden outcome changes
+* No cost changes after results are viewed
+* Abstention and coverage are reported
+* Both positive and negative verdicts are retained
+
+### Exit
+
+The hypothesis receives an OOS verdict:
+
+* PASS — measurable improvement over the baseline ladder
+* FAIL — no reproducible improvement
+* HOLD — evidence is insufficient
+
+A failed hypothesis does not reopen lower authorities.
+
+---
+
+## Phase 7 — Minimal predictive challenger
+
+### Entry condition
+
+Phase 6 shows that the tested outcome is at least partially distinguishable
+from the available past information.
+
+### Question
+
+Can the smallest reasonable predictive model improve selection over simple
+rules and baselines?
+
+### Rules
+
+Model family is selected only at the start of this phase.
+
+The roadmap does not preselect neural networks, boosted trees, sequence models
+or any other architecture.
+
+### Required evidence
+
+* Same data, splits, outcomes and costs as the baselines
+* Calibration
+* Performance by confidence and coverage
+* Untouched OOS evaluation
+* Stability under cost stress
+* Negative controls remain clean
+
+### Exit
+
+The model either beats the baseline ladder under the fixed contract or is
+rejected.
+
+---
+
+## Phase 8 — Additional model capacity
+
+### Entry condition
+
+A simpler model has demonstrated reproducible but capacity-limited signal.
+
+### Question
+
+Does additional temporal or representational capacity improve OOS economic
+results under the unchanged contract?
+
+The architecture is selected from evidence available at this point. No model
+family is promised in advance.
+
+### Exit
+
+The challenger improves the locked evaluation criteria without increasing
+leakage, fragility or unexplained complexity.
+
+Otherwise it is rejected.
+
+---
+
+## Phase 9 — Execution policy research
+
+### Entry condition
+
+An entry decision process has survived multiple untouched OOS periods and
+cost stress using a fixed, deterministic exit baseline.
+
+### Question
+
+Can position management improve realized net_R without weakening immutable
+risk limits?
+
+### Ladder
+
+1. Fixed stop, target and timeout
+2. Simple deterministic exit challengers
+3. Supervised HOLD/CLOSE challenger
+4. Sequential decision method only if simpler challengers leave measurable
+   unresolved value
+
+No reinforcement-learning implementation is presumed by the roadmap.
+
+### Immutable limits
+
+An execution policy may not:
+
+* Widen the protective stop
+* Increase initial account risk
+* Add to a losing position
+* Change leverage after entry
+* Bypass portfolio or daily loss limits
+
+### Exit
+
+The challenger improves net expectancy or downside behavior on untouched data
+without merely converting large winners into small wins.
+
+---
+
+## Phase 10 — Paper and micro-live validation
+
+### Entry condition
+
+A complete decision and execution path survives untouched OOS periods and
+declared cost stress.
+
+### Question
+
+Does observed execution agree with the simulation contract closely enough for
+the result to remain economically valid?
+
+### Progression
+
+* Shadow decisions
+* Paper execution
+* Minimum-size isolated live execution
+
+### Required evidence
+
+* Decision reproducibility
+* Fill and slippage reconciliation
+* Fee and funding reconciliation
+* Backtest-to-paper divergence
+* Paper-to-live divergence
+* Operational failures and missed decisions
+* Predeclared stop conditions
+
+### Exit
+
+The system receives a live verdict. A profitable backtest alone cannot satisfy
+this phase.
+
+---
+
+## Conditional performance work
+
+Hardware acceleration is not a roadmap phase.
+
+After the scalar authority is locked, representative workloads are benchmarked.
+
+* If runtime is acceptable, no fast path is created.
+* If runtime blocks research, a compiled CPU challenger is considered.
+* Parallel CPU execution is considered only after measurement.
+* A GPU event scanner is considered only if measured workloads justify its
+  additional audit surface.
+
+Any accelerated path must reproduce the scalar event authority under parity
+tests. It never becomes the sole economic truth implementation.
+
+---
+
+## Roadmap discipline
+
+Only the **NOW** phase contains implementation detail.
+
+The **NEXT** phase may contain its entry and exit conditions.
+
+All later phases describe questions and gates only. Model architecture,
+instrument universe, timeframe, risk geometry, execution method and accelerator
+remain undecided until evidence makes the decision necessary.

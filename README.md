@@ -27,4 +27,4 @@ salvage/          Code copied from v7-engine. UNAUDITED. Quarantined — see RUL
 
 ## Status
 
-Indicators locked — see commit log. Phase 0 (data integrity) in progress; Phase 1 reference engine (`lab/sim.py`) hardening pending. See [ROADMAP.md](ROADMAP.md). Rules of the house: [RULES.md](RULES.md).
+Phase 0 (indicator authority) and Phase 1 (simulation authority) hardened; lock verification — the full suite from a clean checkout on the remote box — is pending before each authority SHA is recorded. See [ROADMAP.md](ROADMAP.md). Rules of the house: [RULES.md](RULES.md).
