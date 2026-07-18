@@ -1,0 +1,13 @@
+# v7 lab dependencies.
+#
+# Exact pins are frozen from the remote box (the execution environment) during
+# lock verification, not guessed locally. Workflow: install this in a clean
+# venv on the remote box, `pip freeze` the result, then replace the bare names
+# below with the exact versions in the commit that becomes the recorded
+# authority SHA. A clean checkout must reproduce that pinned environment.
+
+# Runtime — imported by lab/indicators.py
+numpy
+
+# Test — required to run lab/tests/
+pytest
