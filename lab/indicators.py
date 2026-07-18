@@ -29,6 +29,25 @@ Contents:
   spread         parkinson_spread, corwin_schultz_spread
   microstructure dollar_volume, amihud_illiquidity, roll_spread_estimator
   volume_profile typical_price, vwap, rolling_vwap
+
+Known P2 numeric-hardening items (ACCEPTED_NON_GOAL — not triggered by real
+market data in finite float64 range):
+- VWAP cumulative rescaling gives past bars permanently half-weight after an
+  overflow event (only at astronomical float values, e.g. 1e308× volume).
+- VWAP tp×vol underflows to 0.0 when both price and volume are subnormal
+  (1e-600 effective dollar volume — no real market produces this).
+- Corwin–Schultz clamped-to-zero for negative alpha (theoretically pure;
+  real data produces zero-spread rather than NaN in ~65% of clean pairs).
+  This is by design: spread cannot be negative, and NaN on clean data
+  violates the module contract.
+- log_returns uses log1p for ±10% range, log-diff otherwise; extreme ratios
+  near the float ceiling may lose sub-ULP precision. Hardening would require
+  arbitrary-precision log, which is out of scope for this module.
+- rolling_vwap protects individual tp×vol products but the window cumsum
+  can overflow with many large but finite bars; guarded to NaN rather than
+  inf (contract: no silently wrong number). Recovering the representable
+  VWAP would require per-window incremental scaling.
+
 """
 
 from __future__ import annotations

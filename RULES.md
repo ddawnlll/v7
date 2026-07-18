@@ -3,8 +3,11 @@
 These rules are fixed. Changing one requires a commit that states what failed without it.
 
 ## 1. Fail closed
-Any stage that receives missing, malformed, or unexpected input **raises**. No fallback paths.
-A pipeline that cannot prove its input is real data produces **no artifact**.
+Structural invalidity (wrong types, mismatched lengths, bad parameters) **raises** — these
+are programming errors. Cell-level dirty market data (NaN, inf, impossible OHLC bars)
+follows each module's contract: typically NaN-out or segment-reset rather than raise, so a
+single bad observation does not crash the pipeline. No fallback paths. A pipeline that
+cannot prove its input is real data produces **no artifact**.
 
 ## 2. Salvage quarantine
 - Nothing imports from `salvage/`. Nothing imports from `v7-engine`.
@@ -63,9 +66,9 @@ in one sitting and fully judge on its own. Do not split a concern across files f
 tidiness, and do not merge unrelated concerns to cut the count. Fewer files, each with
 high standalone audit value: this is how hallucination is caught before it ships.
 
-## 14. Deterministic truth core (`lab/sim/`)
+## 14. Deterministic truth core (`lab/sim.py`)
 The simulation is the single source of economic truth: it defines `net_R`, labels, and
-outcomes. Nothing else in the repo computes money. Inside `lab/sim/`:
+outcomes. Nothing else in the repo computes money. Inside `lab/sim.py`:
 - No wall-clock, no global RNG, no network, no env reads. Every function is a pure
   function of its inputs; any randomness is an explicit seed argument.
 - Iterate in sorted order — never rely on dict/set insertion order.

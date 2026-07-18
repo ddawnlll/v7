@@ -27,4 +27,4 @@ salvage/          Code copied from v7-engine. UNAUDITED. Quarantined — see RUL
 
 ## Status
 
-Phase 0 — bootstrap. See [ROADMAP.md](ROADMAP.md). Rules of the house: [RULES.md](RULES.md).
+Indicators locked — see commit log. Phase 0 (data integrity) in progress; Phase 1 reference engine (`lab/sim.py`) hardening pending. See [ROADMAP.md](ROADMAP.md). Rules of the house: [RULES.md](RULES.md).

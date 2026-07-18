@@ -7,7 +7,9 @@ Data integrity gate + salvage audit queue (`data_lake`, cost params first).
 **Exit:** one verified dataset snapshot (monotonic, gap-flagged, deduped, hashed) built fail-closed from raw parquet.
 
 ## Phase 1 — Outcome engine
-Minimal `outcome_engine.py` (~300–500 lines): barrier walk, fees/slippage/funding, `net_R`, MAE/MFE, exit reason.
+Reference engine `lab/sim.py` exists (barrier walk, fees/slippage/funding, `net_R`, MAE/MFE,
+exit reason). Hardening and exit verification pending: gap semantics, same-bar semantics,
+cost truth, golden trades, cross-machine determinism.
 **Exit:** parity vs frozen v7-engine simulation on N random trades within tolerance, plus 20 trades hand-verified against candles.
 
 ## Phase 2 — Evaluation harness + baselines
