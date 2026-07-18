@@ -100,17 +100,26 @@ def _valid_hlc(h: float, l: float, c: float) -> bool:
 def log_returns(prices: Sequence[float]) -> list[float]:
     """Log returns: ln(P_t) - ln(P_{t-1}). First element is NaN.
 
-    Uses the difference of logs rather than log of the ratio: mathematically
-    identical but avoids forming an intermediate ratio that could over/underflow
-    at extreme magnitudes. NaN where either price is non-finite or non-positive.
+    Uses difference of logs for wide ratios (overflow-safe) and ``log1p`` of the
+    simple return for small changes (preserves sub-ULP precision; e.g. 1e10 →
+    nextafter gives ~2e-16 rather than 0.0). NaN where either price is non-finite
+    or non-positive.
     """
     n = len(prices)
     if n < 2:
         return [_NAN] * n
     result: list[float] = [_NAN] * n
     for i in range(1, n):
-        if _valid_price(prices[i - 1]) and _valid_price(prices[i]):
-            result[i] = math.log(prices[i]) - math.log(prices[i - 1])
+        if not (_valid_price(prices[i - 1]) and _valid_price(prices[i])):
+            continue
+        prev, curr = prices[i - 1], prices[i]
+        ratio = curr / prev
+        if 0.9 <= ratio <= 1.1:
+            # Small change: log1p preserves precision better than log diff.
+            sr = (curr - prev) / prev
+            result[i] = math.log1p(sr) if math.isfinite(sr) else _NAN
+        else:
+            result[i] = math.log(curr) - math.log(prev)
     return result
 
 
@@ -126,7 +135,9 @@ def simple_returns(prices: Sequence[float]) -> list[float]:
     result: list[float] = [_NAN] * n
     for i in range(1, n):
         if _valid_price(prices[i - 1]) and _valid_price(prices[i]):
-            result[i] = (prices[i] - prices[i - 1]) / prices[i - 1]
+            val = (prices[i] - prices[i - 1]) / prices[i - 1]
+            if math.isfinite(val):
+                result[i] = val
     return result
 
 
@@ -150,15 +161,25 @@ def momentum(prices: Sequence[float], period: int = 10) -> list[float]:
     for i in range(period, n):
         base, curr = prices[i - period], prices[i]
         if _valid_price(base) and _valid_price(curr):
-            result[i] = (curr - base) / base
+            val = (curr - base) / base
+            if math.isfinite(val):
+                result[i] = val
     return result
 
 
 def rate_of_change(prices: Sequence[float], period: int = 10) -> list[float]:
     """Rate of Change: momentum * 100. Same signal as `momentum`, percentage
-    units — not an independent feature. First `period` values are NaN."""
+    units — not an independent feature. First `period` values are NaN.
+
+    The post-multiply by 100 can overflow even when momentum itself is finite
+    (e.g. momentum ≈ 1e307 → 1e309 → inf). Finite-guarded so the output contract
+    (NaN for dirty / unrepresentable) holds.
+    """
     raw = momentum(prices, period=period)
-    return [v * 100 if v == v else v for v in raw]  # v == v is False for NaN
+    return [
+        (v * 100.0) if (v == v and math.isfinite(v * 100.0)) else _NAN
+        for v in raw
+    ]
 
 
 # --- rsi ---------------------------------------------------------------------
@@ -173,6 +194,11 @@ def rsi(prices: Sequence[float], period: int = 14) -> list[float]:
     Dirty data segment-resets: an invalid price transition discards the running
     averages; RSI re-seeds only after `period` consecutive valid transitions, so
     a single bad bar does not emit a misleading value or poison the tail.
+
+    Uses an incremental mean (Welford-style) for the seed phase so that large
+    gains/losses cannot overflow `sum(seed_gains)` before the division; Wilder
+    updating uses the numerically equivalent `avg += (val - avg) / period`
+    recurrence for the same reason.
     """
     _validate_period(period)
     if period < 2:
@@ -183,15 +209,11 @@ def rsi(prices: Sequence[float], period: int = 14) -> list[float]:
     result: list[float] = [_NAN] * n
 
     valid_run = 0
-    seed_gains: list[float] = []
-    seed_losses: list[float] = []
     avg_gain = avg_loss = _NAN
 
     for i in range(1, n):
         if not (_valid_price(prices[i - 1]) and _valid_price(prices[i])):
             valid_run = 0
-            seed_gains.clear()
-            seed_losses.clear()
             avg_gain = avg_loss = _NAN
             continue
 
@@ -201,17 +223,28 @@ def rsi(prices: Sequence[float], period: int = 14) -> list[float]:
         valid_run += 1
 
         if valid_run < period:
-            seed_gains.append(gain)
-            seed_losses.append(loss)
+            # Incremental mean: numerically stable, overflow-resistant
+            if valid_run == 1:
+                avg_gain = gain
+                avg_loss = loss
+            else:
+                avg_gain += (gain - avg_gain) / valid_run
+                avg_loss += (loss - avg_loss) / valid_run
             continue
         if valid_run == period:
-            seed_gains.append(gain)
-            seed_losses.append(loss)
-            avg_gain = sum(seed_gains) / period
-            avg_loss = sum(seed_losses) / period
+            # Transition from seed to Wilder: fold last sample into the seed mean
+            avg_gain += (gain - avg_gain) / period
+            avg_loss += (loss - avg_loss) / period
         else:
-            avg_gain = (avg_gain * (period - 1) + gain) / period
-            avg_loss = (avg_loss * (period - 1) + loss) / period
+            # Wilder EMA: avg += (val - avg) / period
+            avg_gain += (gain - avg_gain) / period
+            avg_loss += (loss - avg_loss) / period
+
+        # Guard: the incremental recurrence can still overflow at extreme inputs.
+        if not (math.isfinite(avg_gain) and math.isfinite(avg_loss)):
+            valid_run = 0
+            avg_gain = avg_loss = _NAN
+            continue
 
         if avg_gain == 0.0 and avg_loss == 0.0:
             result[i] = 50.0
@@ -248,31 +281,49 @@ def compute_atr(
     result: list[float] = [_NAN] * n
 
     valid_run = 0
-    seed_tr: list[float] = []
     atr = _NAN
 
     for i in range(1, n):
-        hi, lo, cl, prev_cl = highs[i], lows[i], closes[i], closes[i - 1]
-        # This bar must be a valid HLC bar; the prior close (feeding true range)
-        # must itself be a usable price. A dirty prior bar reset the run already.
-        if not (_valid_hlc(hi, lo, cl) and _valid_price(prev_cl)):
+        hi, lo, cl = highs[i], lows[i], closes[i]
+        prev_hi, prev_lo, prev_cl = highs[i - 1], lows[i - 1], closes[i - 1]
+        # Both the current bar AND the previous bar must be valid HLC bars,
+        # since the previous bar's close feeds the true range calculation.
+        # A prior bar that was impossible (high < low, etc.) is dirty data
+        # and must not contaminate the current true range.
+        if not (_valid_hlc(hi, lo, cl) and _valid_hlc(prev_hi, prev_lo, prev_cl)):
             valid_run = 0
-            seed_tr.clear()
             atr = _NAN
             continue
 
         tr = max(hi - lo, abs(hi - prev_cl), abs(lo - prev_cl))
         valid_run += 1
 
-        if valid_run < period:
-            seed_tr.append(tr)
+        if valid_run == 1:
+            # First clean bar after reset: seed ATR directly.
+            atr = tr
+            if period == 1:
+                # Period 1: first bar is both seed and output. Falling through to
+                # the `valid_run >= period` check below emits the value.
+                pass
+            else:
+                # Period > 1: building seed mean; not enough bars yet to emit.
+                continue
+        elif valid_run < period:
+            # Incremental mean for remaining seed bars.
+            atr += (tr - atr) / valid_run
             continue
-        if valid_run == period:
-            seed_tr.append(tr)
-            atr = sum(seed_tr) / period
+        elif valid_run == period:
+            # Transition: fold the last seed observation, then switch to EMA.
+            atr += (tr - atr) / period
         else:
-            atr = (atr * (period - 1) + tr) / period
-        result[i] = atr
+            # Wilder EMA: avg += (val - avg) / period
+            atr += (tr - atr) / period
+
+        if math.isfinite(atr):
+            result[i] = atr
+        else:
+            valid_run = 0
+            atr = _NAN
     return result
 
 
@@ -280,7 +331,14 @@ def compute_atr(
 
 def rolling_std(values: Sequence[float], period: int = 20) -> list[float]:
     """Rolling population std (ddof=0). First `period-1` values are NaN.
-    A window containing any non-finite value yields NaN."""
+    A window containing any non-finite value yields NaN.
+
+    Each window is scaled by its max absolute value before computing variance
+    via Welford's algorithm, then the std is unscaled. This prevents both
+    overflow and underflow in the ``delta * (x - mean)`` intermediate product,
+    so that large but representable stds (e.g. 5e307) and tiny but non-zero
+    stds (e.g. 5e-301) are preserved rather than silently NaN'd or zeroed.
+    """
     _validate_period(period)
     n = len(values)
     result: list[float] = [_NAN] * n
@@ -288,9 +346,23 @@ def rolling_std(values: Sequence[float], period: int = 20) -> list[float]:
         window = values[i - period + 1 : i + 1]
         if any(not math.isfinite(x) for x in window):
             continue
-        mean = sum(window) / period
-        variance = sum((x - mean) ** 2 for x in window) / period
-        result[i] = math.sqrt(variance)
+        s = max(abs(x) for x in window)
+        if s == 0.0:
+            result[i] = 0.0
+            continue
+        scaled = [x / s for x in window]
+        mean = 0.0
+        m2 = 0.0
+        for k, x in enumerate(scaled):
+            delta = x - mean
+            mean += delta / (k + 1)
+            m2 += delta * (x - mean)
+        try:
+            val = s * math.sqrt(m2 / period)
+            if math.isfinite(val):
+                result[i] = val
+        except (OverflowError, ValueError):
+            continue
     return result
 
 
@@ -317,9 +389,22 @@ def parkinson_vol(
             if not (_valid_price(highs[j]) and _valid_price(lows[j]) and highs[j] >= lows[j]):
                 ok = False
                 break
-            sum_sq += math.log(highs[j] / lows[j]) ** 2
-        if ok:
-            result[i] = math.sqrt(c * sum_sq / period)
+            # log(H) - log(L) = log(H/L) — mathematically identical but avoids
+            # forming the intermediate ratio which can overflow at extreme prices.
+            log_ratio = math.log(highs[j]) - math.log(lows[j])
+            if not math.isfinite(log_ratio):
+                ok = False
+                break
+            sq = log_ratio * log_ratio
+            if not math.isfinite(sq):
+                ok = False
+                break
+            sum_sq += sq
+        if not ok:
+            continue
+        val = math.sqrt(c * sum_sq / period)
+        if math.isfinite(val):
+            result[i] = val
     return result
 
 
@@ -387,7 +472,12 @@ def rolling_min(values: Sequence[float], period: int = 20) -> list[float]:
 
 def rolling_mean(values: Sequence[float], period: int = 20) -> list[float]:
     """Rolling mean. First `period-1` values NaN. A window with any non-finite
-    value yields NaN."""
+    value yields NaN.
+
+    Each window is scaled by its max absolute value so that opposite-sign
+    extremes (e.g. [-MAX, +MAX] → 0.0) do not cause the incremental-mean
+    subtraction to overflow.
+    """
     _validate_period(period)
     n = len(values)
     result: list[float] = [_NAN] * n
@@ -395,7 +485,17 @@ def rolling_mean(values: Sequence[float], period: int = 20) -> list[float]:
         window = values[i - period + 1 : i + 1]
         if any(not math.isfinite(x) for x in window):
             continue
-        result[i] = sum(window) / period
+        s = max(abs(x) for x in window)
+        if s == 0.0:
+            result[i] = 0.0
+            continue
+        scaled = [x / s for x in window]
+        mean = 0.0
+        for k, x in enumerate(scaled):
+            mean += (x - mean) / (k + 1)
+        val = mean * s
+        if math.isfinite(val):
+            result[i] = val
     return result
 
 
@@ -469,13 +569,17 @@ def parkinson_spread(highs: Sequence[float], lows: Sequence[float]) -> list[floa
     _validate_equal_lengths(highs, lows)
     n = len(highs)
     result: list[float] = [_NAN] * n
-    inv_4ln2 = 1.0 / (4.0 * math.log(2.0))
+    sqrt_inv_4ln2 = math.sqrt(1.0 / (4.0 * math.log(2.0)))
     for i in range(n):
         hi, lo = highs[i], lows[i]
         if not (_valid_price(hi) and _valid_price(lo) and hi >= lo):
             continue
-        diff = hi - lo
-        result[i] = math.sqrt(diff * diff * inv_4ln2)
+        # |H-L| * sqrt(1/(4ln2)) = sqrt((H-L)²/(4ln2)) — mathematically identical
+        # but avoids the intermediate diff² overflow when diff ≈ 1e154.
+        diff = abs(hi - lo)
+        val = diff * sqrt_inv_4ln2
+        if math.isfinite(val):
+            result[i] = val
     return result
 
 
@@ -483,9 +587,9 @@ def corwin_schultz_spread(highs: Sequence[float], lows: Sequence[float]) -> list
     """Corwin-Schultz (2012) two-day high-low spread estimator.
 
     First value is NaN (needs two bars). Negative estimates (variance term
-    dominates) are NaN. Uses 2*tanh(alpha/2) — the overflow-safe form of
-    2*(e^alpha - 1)/(1 + e^alpha) — so large alpha can't overflow; the spread
-    stays bounded below 2 as the theory requires.
+    dominates) are clamped to zero. Uses 2*tanh(alpha/2) — the overflow-safe
+    form of 2*(e^alpha - 1)/(1 + e^alpha) — so large alpha can't overflow;
+    the spread stays bounded below 2 as the theory requires.
     """
     _validate_equal_lengths(highs, lows)
     n = len(highs)
@@ -497,13 +601,15 @@ def corwin_schultz_spread(highs: Sequence[float], lows: Sequence[float]) -> list
             continue
         if h1 < l1 or h2 < l2:
             continue
-        beta = math.log(h1 / l1) ** 2 + math.log(h2 / l2) ** 2
-        gamma = math.log(max(h1, h2) / min(l1, l2)) ** 2
+        beta = (math.log(h1) - math.log(l1)) ** 2 + (math.log(h2) - math.log(l2)) ** 2
+        gamma = (math.log(max(h1, h2)) - math.log(min(l1, l2))) ** 2
         alpha = (math.sqrt(2.0 * beta) - math.sqrt(beta)) * inv_denom - math.sqrt(
             gamma * inv_denom
         )
-        if alpha <= 0:
-            continue
+        # Negative-alpha estimates are theoretically a negative spread (variance
+        # dominates). Clamp to zero: the spread cannot be negative, and emitting
+        # NaN for clean data violates the "clean regions stay valid" contract.
+        alpha = max(0.0, alpha)
         result[i] = 2.0 * math.tanh(alpha / 2.0)
     return result
 
@@ -520,7 +626,10 @@ def dollar_volume(prices: Sequence[float], volumes: Sequence[float]) -> list[flo
     p = np.asarray(prices, dtype=np.float64)
     v = np.asarray(volumes, dtype=np.float64)
     valid = np.isfinite(p) & np.isfinite(v) & (p > 0.0) & (v >= 0.0)
-    return np.where(valid, p * v, np.nan).tolist()
+    with np.errstate(over="ignore", invalid="ignore"):
+        product = p * v
+    result = np.where(valid & np.isfinite(product), product, np.nan)
+    return result.tolist()
 
 
 def amihud_illiquidity(
@@ -536,6 +645,12 @@ def amihud_illiquidity(
     values NaN. Strict window: if any observation in the window is invalid
     (non-finite return, non-positive dollar volume), the result is NaN — the
     sample size is never silently shrunk.
+
+    Each window is summed independently via ``math.fsum`` (Kahan-style
+    compensated summation). The old global ``np.cumsum`` approach suffered
+    catastrophic cancellation: a large early contribution left the accumulator
+    at a magnitude that swallowed later small entries even after the large
+    value rotated out of the window, silently zeroing clean regions.
     """
     _validate_period(period)
     _validate_equal_lengths(returns, dollar_volumes)
@@ -545,16 +660,23 @@ def amihud_illiquidity(
         return result.tolist()
     r = np.asarray(returns, dtype=np.float64)
     dv = np.asarray(dollar_volumes, dtype=np.float64)
-    valid = (dv > 0) & np.isfinite(r) & np.isfinite(dv)
-    contrib = np.where(valid, np.abs(r) / np.where(valid, dv, 1.0), 0.0)
-    csum = np.cumsum(np.insert(contrib, 0, 0.0))
-    vcount = np.cumsum(np.insert(valid.astype(np.float64), 0, 0.0))
-    idx = np.arange(period - 1, n)
-    start = idx - period + 1
-    total = csum[idx + 1] - csum[start]
-    n_valid = vcount[idx + 1] - vcount[start]
-    all_valid = n_valid == period  # strict: whole window must be clean
-    result[idx[all_valid]] = total[all_valid] / period
+    base_valid = (dv > 0) & np.isfinite(r) & np.isfinite(dv)
+    with np.errstate(over="ignore", invalid="ignore"):
+        contrib_raw = np.abs(r) / np.where(base_valid, dv, 1.0)
+    contrib_valid = base_valid & np.isfinite(contrib_raw)
+
+    for i in range(period - 1, n):
+        start = i - period + 1
+        window_valid = contrib_valid[start : i + 1]
+        if not np.all(window_valid):
+            continue
+        try:
+            total = math.fsum(float(x) for x in contrib_raw[start : i + 1])
+        except OverflowError:
+            continue
+        val = total / period
+        if math.isfinite(val):
+            result[i] = val
     return result.tolist()
 
 
@@ -568,6 +690,8 @@ def roll_spread_estimator(prices: Sequence[float], period: int = 20) -> list[flo
     shrunk covariance).
     """
     _validate_period(period)
+    if period < 3:
+        raise ValueError(f"Roll spread period must be >= 3, got {period}")
     n = len(prices)
     result: list[float] = [_NAN] * n
     if n < period + 1:
@@ -581,10 +705,30 @@ def roll_spread_estimator(prices: Sequence[float], period: int = 20) -> list[flo
         lead = deltas[1:]   # dp_t
         lag = deltas[:-1]   # dp_{t-1}
         m = len(lead)       # period - 1 pairs
-        mean_lead = sum(lead) / m
-        mean_lag = sum(lag) / m
-        cov = sum((a - mean_lead) * (b - mean_lag) for a, b in zip(lead, lag)) / m
-        result[i] = 2.0 * math.sqrt(-cov) if cov < 0 else 0.0
+
+        # Scale deltas by max absolute delta to prevent covariance overflow.
+        # Rescaling AFTER the sqrt (cov_scaled is in [-1,1]) keeps subnormal
+        # spreads representable: cov_scaled * scale^2 can underflow to 0.0
+        # while scale * sqrt(-cov_scaled) stays non-zero.
+        scale = max(abs(x) for x in deltas)
+        if scale != 0.0:
+            scaled_deltas = [x / scale for x in deltas]
+            scaled_lead = scaled_deltas[1:]
+            scaled_lag = scaled_deltas[:-1]
+            mean_l = sum(scaled_lead) / m
+            mean_g = sum(scaled_lag) / m
+            cov_scaled = sum(
+                (a - mean_l) * (b - mean_g)
+                for a, b in zip(scaled_lead, scaled_lag)
+            ) / m
+            if cov_scaled < 0:
+                val = scale * (2.0 * math.sqrt(-cov_scaled))
+                if math.isfinite(val):
+                    result[i] = val
+            elif math.isfinite(cov_scaled):
+                result[i] = 0.0
+        else:
+            result[i] = 0.0
     return result
 
 
@@ -595,13 +739,21 @@ def typical_price(
     lows: Sequence[float],
     closes: Sequence[float],
 ) -> list[float]:
-    """Typical price: (high + low + close) / 3. NaN for an invalid HLC bar."""
+    """Typical price: (high + low + close) / 3. NaN for an invalid HLC bar.
+
+    Computed as h/3 + l/3 + c/3 rather than (h+l+c)/3 so the intermediate sum
+    does not overflow when all three prices are near the float ceiling — the
+    final result is representable even when h+l+c is not.
+    """
     _validate_equal_lengths(highs, lows, closes)
     n = len(highs)
     result: list[float] = [_NAN] * n
+    inv3 = 1.0 / 3.0
     for i in range(n):
         if _valid_hlc(highs[i], lows[i], closes[i]):
-            result[i] = (highs[i] + lows[i] + closes[i]) / 3.0
+            val = highs[i] * inv3 + lows[i] * inv3 + closes[i] * inv3
+            if math.isfinite(val):
+                result[i] = val
     return result
 
 
@@ -619,16 +771,47 @@ def vwap(
     n = len(highs)
     result: list[float] = [_NAN] * n
     cum_pv = cum_v = 0.0
+    inv3 = 1.0 / 3.0
     for i in range(n):
         hi, lo, cl, vol = highs[i], lows[i], closes[i], volumes[i]
         if not (_valid_hlc(hi, lo, cl) and math.isfinite(vol) and vol >= 0.0):
             cum_pv = cum_v = 0.0  # segment reset
             continue
-        tp = (hi + lo + cl) / 3.0
-        cum_pv += tp * vol
-        cum_v += vol
+        # Safe TP: divide-then-add, same as typical_price.
+        tp = hi * inv3 + lo * inv3 + cl * inv3
+        if not math.isfinite(tp):
+            cum_pv = cum_v = 0.0
+            continue
+        # Zero volume: emit current VWAP but do not affect accumulator.
+        # Zero-volume bars are valid data (no trades), not a reason to reset.
+        if vol == 0.0:
+            if cum_v > 0:
+                result[i] = cum_pv / cum_v
+            continue
+        # Rescale accumulators before adding when either is near max float.
+        # Halving both preserves VWAP = cum_pv / cum_v exactly, and the new
+        # bar is also halved so the relative weight is unchanged.
+        thresh = float.fromhex("0x1.fffffffffffffp+1022")  # ~MAX/2
+        if abs(cum_pv) > thresh or abs(cum_v) > thresh:
+            cum_pv *= 0.5
+            cum_v *= 0.5
+            contrib = tp * vol * 0.5
+            if not math.isfinite(contrib):
+                cum_pv = cum_v = 0.0
+                continue
+            cum_pv += contrib
+            cum_v += vol * 0.5
+        else:
+            contrib = tp * vol
+            if not math.isfinite(contrib):
+                cum_pv = cum_v = 0.0
+                continue
+            cum_pv += contrib
+            cum_v += vol
         if cum_v > 0:
-            result[i] = cum_pv / cum_v
+            val = cum_pv / cum_v
+            if math.isfinite(val):
+                result[i] = val
     return result
 
 
@@ -640,11 +823,16 @@ def rolling_vwap(
     period: int = 20,
 ) -> list[float]:
     """Rolling VWAP over a fixed window. First `period-1` values are NaN. A window
-    containing any invalid bar yields NaN."""
+    containing any invalid bar yields NaN.
+
+    Uses safe TP (divide-then-add) to avoid intermediate overflow in the price
+    sum; per-bar contribution and window totals are likewise overflow-guarded.
+    """
     _validate_period(period)
     _validate_equal_lengths(highs, lows, closes, volumes)
     n = len(highs)
     result: list[float] = [_NAN] * n
+    inv3 = 1.0 / 3.0
     for i in range(period - 1, n):
         cum_pv = cum_v = 0.0
         ok = True
@@ -653,9 +841,15 @@ def rolling_vwap(
             if not (_valid_hlc(hi, lo, cl) and math.isfinite(vol) and vol >= 0.0):
                 ok = False
                 break
-            tp = (hi + lo + cl) / 3.0
-            cum_pv += tp * vol
+            tp = hi * inv3 + lo * inv3 + cl * inv3
+            contrib = tp * vol
+            if not (math.isfinite(tp) and math.isfinite(contrib)):
+                ok = False
+                break
+            cum_pv += contrib
             cum_v += vol
-        if ok and cum_v > 0:
-            result[i] = cum_pv / cum_v
+        if ok and cum_v > 0 and math.isfinite(cum_pv) and math.isfinite(cum_v):
+            val = cum_pv / cum_v
+            if math.isfinite(val):
+                result[i] = val
     return result

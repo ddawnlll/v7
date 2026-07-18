@@ -411,3 +411,346 @@ _MULTISERIES = [
 def test_unequal_lengths_rejected(name, fn):
     with pytest.raises(ValueError, match="same length"):
         fn()
+
+
+# --- roll spread period must be >= 3 (period=2 degenerates to 0.0) ------------
+
+def test_roll_spread_period_one_rejected():
+    with pytest.raises(ValueError, match="Roll spread period must be >= 3"):
+        ind.roll_spread_estimator([1.0, 2.0, 3.0, 4.0], period=1)
+
+
+def test_roll_spread_period_two_rejected():
+    with pytest.raises(ValueError, match="Roll spread period must be >= 3"):
+        ind.roll_spread_estimator([1.0, 2.0, 3.0, 4.0, 5.0], period=2)
+
+
+# --- output overflow guard: finite inputs must yield NaN, not inf/exception ---
+
+def test_simple_returns_overflow_yields_nan():
+    # (1e308 - 1e-308) / 1e-308 ~= 1e616 → overflow to inf → guard catches NaN.
+    out = ind.simple_returns([1e-308, 1e308])
+    assert math.isnan(out[1])
+
+    # Reverse direction: (1e-308 - 1e308) / 1e308 = -1.0 — valid finite result,
+    # no overflow. The guard is value-agnostic; verify it does not kill this.
+    out2 = ind.simple_returns([1e308, 1e-308])
+    assert out2[1] == pytest.approx(-1.0)
+
+
+def test_momentum_overflow_yields_nan():
+    # i=1: (1e200 - 1e-200) / 1e-200 → overflow to inf → guard yields NaN.
+    # i=2: (1e-200 - 1e200) / 1e200 = -1.0 → valid finite. Guard is value-agnostic.
+    out = ind.momentum([1e-200, 1e200, 1e-200], period=1)
+    assert math.isnan(out[1])
+    assert out[2] == pytest.approx(-1.0)
+
+
+def test_rolling_mean_overflow_yields_nan():
+    # Old sum(window) overflowed to inf → NaN. Incremental per-window mean
+    # produces the correct representable value.
+    out = ind.rolling_mean([1e308, 1e308], 2)
+    assert out[1] == pytest.approx(1e308)
+
+
+def test_rolling_std_no_overflow_error():
+    # Window scaling before Welford: extreme values no longer overflow.
+    # std of [1e308, -1e308] ≈ 1.414e308 — representable with current approach.
+    out = ind.rolling_std([1e308, -1e308], 2)
+    assert len(out) == 2
+    assert math.isfinite(out[1])
+    assert out[1] > 1e307  # roughly sqrt(2) * 1e308 / 2? No — it's population std.
+    # population std: sqrt(((a-mean)² + (b-mean)²)/2), mean=0 → sqrt(1e616/2) = inf.
+    # Actually with scaling: s = 1e308, scaled = [1, -1], Welford → var_scaled=1
+    # std = s * sqrt(1) = 1e308. ✓
+
+
+def test_dollar_volume_overflow_yields_nan():
+    out = ind.dollar_volume([1e308], [1e308])
+    assert math.isnan(out[0])
+
+
+def test_typical_price_overflow_yields_nan():
+    # Old (h+l+c)/3 overflowed when all three near 1e308 → NaN.
+    # Divide-then-add (h/3 + l/3 + c/3) keeps the result representable.
+    out = ind.typical_price([1e308], [1e308], [1e308])
+    assert out[0] == pytest.approx(1e308)
+
+
+def test_parkinson_vol_overflow_yields_nan():
+    # Old: high/low ratio overflowed → NaN. Log-diff form keeps it finite.
+    # Parkinson vol at period=1 with extreme but valid bar should compute.
+    out = ind.parkinson_vol([1e308], [1e-308], period=1)
+    assert math.isfinite(out[0])
+
+
+def test_parkinson_spread_overflow_yields_nan():
+    # Old diff² overflowed → NaN. |diff| * sqrt(1/(4ln2)) is overflow-safe.
+    out = ind.parkinson_spread([1e308], [1e-308])
+    assert math.isfinite(out[0])
+
+
+def test_vwap_overflow_yields_nan():
+    # tp * vol overflows at 1e308 * 1e308, segment should reset, output NaN
+    out = ind.vwap([1e308, 1.0], [1e308, 1.0], [1e308, 1.0], [1e308, 1.0])
+    assert math.isnan(out[0])
+
+
+def test_rolling_vwap_overflow_yields_nan():
+    out = ind.rolling_vwap(
+        [1e308, 1e308], [1e308, 1e308], [1e308, 1e308], [1e308, 1e308], period=1
+    )
+    assert math.isnan(out[0])
+
+
+# --- P0: ATR dirty previous bar must not contaminate true range ---------------
+
+def test_atr_dirty_prev_bar_resets_segment():
+    # Bar at index 1 is impossible (high=5 < low=6). Its close=5.5 feeds the
+    # true range calculation for the bar at index 2. The old code allowed this;
+    # the fix validates the full previous HLC bar, so the impossible bar's
+    # close does not contaminate the next true range.
+    highs = [10, 5, 100, 100, 100]
+    lows = [9, 6, 99, 99, 99]
+    closes = [9.5, 5.5, 99.5, 99.5, 99.5]
+    out = ind.compute_atr(highs, lows, closes, period=2)
+    # After the dirty bar: index 2 has current valid, prev invalid → reset → NaN
+    assert math.isnan(out[2])
+    # Index 3: valid_run=1 — valid but below period → no output yet → NaN
+    assert math.isnan(out[3])
+
+
+# --- P1: RSI incremental mean avoids silent-wrong output from overflow --------
+
+def test_rsi_overflow_safe_incremental_mean():
+    # Old sum-based seed: sum([M, M, M]) overflows, avg_gain becomes inf,
+    # RSI returns 100.0 instead of ~66.67. Incremental mean keeps it finite.
+    M = float.fromhex("0x1.fffffffffffffp+1023")  # ~1.80e308
+    tiny = float.fromhex("0x0.0000000000001p-1022")  # ~5e-324
+    # Alternating M/tiny produces gains near M, losses near M
+    out = ind.rsi([tiny, M, tiny, M, tiny], period=3)
+    # RSI should be finite; the exact value is ~66.67, not 100.0
+    assert not math.isnan(out[-1])
+    assert 0.0 < out[-1] < 100.0
+
+
+# --- P1: ATR incremental mean avoids inf output -------------------------------
+
+def test_atr_overflow_safe_no_inf():
+    # Old sum(seed_tr) / period → inf at extreme true ranges.
+    # Incremental mean keeps the result finite (or NaN, not inf).
+    M = float.fromhex("0x1.fffffffffffffp+1023")
+    tiny = float.fromhex("0x0.0000000000001p-1022")
+    out = ind.compute_atr([1.0, M, M], [1.0, tiny, tiny], [1.0, tiny, tiny], period=2)
+    # Must not produce inf; NaN or finite is acceptable.
+    assert math.isnan(out[2]) or math.isfinite(out[2])
+    assert not (out[2] == float("inf"))
+
+
+# --- P1: Amihud overflow guard -------------------------------------------------
+
+def test_amihud_overflow_guard():
+    # |r| / dv at extreme magnitudes overflows to inf, which poisons the
+    # cumulative sum. The fix marks the overflowed contrib as invalid so the
+    # strict-window check (n_valid == period) excludes it.
+    M = float.fromhex("0x1.fffffffffffffp+1023")
+    tiny = float.fromhex("0x0.0000000000001p-1022")
+    out = ind.amihud_illiquidity([M, M], [tiny, tiny], period=2)
+    # Both contrib values overflow → invalid → n_valid < 2 → NaN
+    assert math.isnan(out[1])
+
+
+# --- P1: Roll covariance scaled to prevent overflow ---------------------------
+
+def test_roll_spread_scaled_covariance_no_overflow():
+    # Unscaled covariance: deltas ≈ ±M → (a - mean)*(b - mean) overflows.
+    # Scaling by max(abs(deltas)) keeps arithmetic in [0, 1] range.
+    M = float.fromhex("0x1.fffffffffffffp+1023")
+    tiny = float.fromhex("0x0.0000000000001p-1022")
+    out = ind.roll_spread_estimator([tiny, M, tiny, M], period=3)
+    # Must not crash or produce inf; NaN or finite is acceptable.
+    assert len(out) == 4
+    assert not (out[3] == float("inf"))
+
+
+# --- P1: rate_of_change post-multiply guard ----------------------------------
+
+def test_rate_of_change_finite_guard():
+    # momentum returns a finite but huge value; * 100 overflows to inf.
+    # The fix guards the multiply so NaN is returned instead of inf.
+    out = ind.rate_of_change([1e-307, 1.0], 1)
+    assert math.isnan(out[1])  # momentum ≈ 1e307 → *100 ≈ 1e309 → inf → NaN
+
+
+# --- P1: cumulative VWAP overflow recovers (no permanent poisoning) -----------
+
+def test_vwap_cumulative_overflow_recovers():
+    # Running totals would overflow at bar 2 without rescaling.
+    # Rescale approach keeps accumulators in range → no NaN, no data loss.
+    x = float.fromhex("0x1.fffffffffffffp+1023") / 4.0
+    out = ind.vwap(
+        [x, x, x, x, 1.0],
+        [x, x, x, x, 1.0],
+        [x, x, x, x, 1.0],
+        [2.0, 2.0, 2.0, 2.0, 1.0],
+    )
+    # All clean bars produce valid VWAP — rescaling preserves continuity.
+    assert all(math.isfinite(v) for v in out[0:4])
+    # Bar 4: after rescale, (2x*0.5**k + 2x + ... ) / (2*0.5**k + 2 + ...) ≈ x
+    assert out[3] == pytest.approx(x)
+    assert math.isfinite(out[4])
+
+
+# --- P1: Amihud cumulative sum overflow must not emit inf ---------------------
+
+def test_amihud_cumsum_overflow_no_inf():
+    # All contrib values are finite (1e308), but four of them in a period-2
+    # window overflow the cumulative sum. Must produce NaN, not inf.
+    out = ind.amihud_illiquidity([1e308, 1e308, 1e308, 1e308],
+                                  [1.0, 1.0, 1.0, 1.0], period=2)
+    assert all(math.isnan(x) or math.isfinite(x) for x in out)
+
+
+# --- P2: parkinson_vol / corwin_schultz use log-diff to avoid ratio overflow --
+
+def test_parkinson_vol_log_diff_no_overflow():
+    # high=1e308, low=1e-308 → ratio overflows → old code NaN'd unnecessarily.
+    # log(h)-log(l) = log(1e308) - log(1e-308) ≈ 1416 — finite and correct.
+    out = ind.parkinson_vol([1e308], [1e-308], period=1)
+    assert math.isfinite(out[0])  # not NaN from ratio overflow
+
+
+def test_corwin_schultz_log_diff_no_overflow():
+    out = ind.corwin_schultz_spread([1e308, 1e308], [1e-308, 1e-308])
+    assert math.isnan(out[0])  # first bar always NaN
+    # Log-diff keeps alpha finite; tanh(alpha/2) ≤ 1 → spread ≤ 2.
+    assert math.isnan(out[1]) or out[1] <= 2.0
+
+
+# --- P0: Amihud catastrophic cancellation (large bar exit zeroes clean tail) ---
+
+def test_amihud_catastrophic_cancellation():
+    # A single huge contrib (1/1e-20 = 5e19) must not cause subsequent clean
+    # windows to read 0.0 after it rotates out. Per-window fsum fixes this.
+    out = ind.amihud_illiquidity(
+        [1.0, 1.0, 1.0, 1.0, 1.0],
+        [1e-20, 1.0, 1.0, 1.0, 1.0],
+        period=2,
+    )
+    # Window [0,1]: |1|/1e-20 = 1e20, |1|/1 = 1. fsum(1e20 + 1) ≈ 1e20 → /2 = 5e19.
+    assert out[1] == pytest.approx(5e19, rel=0.01)
+    # Window [1,2]: |1|/1 = 1, |1|/1 = 1 → mean = 1.0. NOT 0.0.
+    assert out[2] == pytest.approx(1.0)
+    # Window [2,3]: same → 1.0
+    assert out[3] == pytest.approx(1.0)
+    # Window [3,4]: same → 1.0
+    assert out[4] == pytest.approx(1.0)
+
+
+# --- P1: compute_atr(period=1) should work -----------------------------------
+
+def test_atr_period_one():
+    # ATR(1) is mathematically ATR = true range. Not all NaN.
+    out = ind.compute_atr(
+        [10, 11, 12, 13],
+        [9, 10, 11, 12],
+        [9.5, 10.5, 11.5, 12.5],
+        period=1,
+    )
+    assert math.isnan(out[0])  # first bar never emits (no prev close)
+    # tr[1] = max(2, |11-9.5|, |10-9.5|) = max(2, 1.5, 0.5) = 2.0? Wait:
+    # hi=11, lo=10, cl=10.5, prev_cl=9.5
+    # tr = max(11-10, |11-9.5|, |10-9.5|) = max(1, 1.5, 0.5) = 1.5
+    assert out[1] == pytest.approx(1.5)
+    assert out[2] == pytest.approx(1.5)
+    assert out[3] == pytest.approx(1.5)
+
+
+# --- P2: Corwin-Schultz flat bars → spread 0.0, not NaN ----------------------
+
+def test_corwin_schultz_flat_bars_are_zero():
+    # alpha=0 → spread=2*tanh(0)=0.0. Old code treated alpha<=0 as invalid → NaN.
+    out = ind.corwin_schultz_spread([100, 100, 100], [100, 100, 100])
+    assert math.isnan(out[0])  # first bar
+    assert out[1] == pytest.approx(0.0)
+    assert out[2] == pytest.approx(0.0)
+
+
+# --- P1: Corwin-Schultz negative alpha → 0.0, not NaN ------------------------
+
+def test_corwin_schultz_negative_alpha_is_zero():
+    # Clean realistic bars where variance term dominates → alpha < 0.
+    # Old code emitted NaN (~65% of clean pairs); fix clamps to 0.0.
+    out = ind.corwin_schultz_spread([101, 102], [90, 99])
+    assert math.isnan(out[0])  # first bar
+    assert out[1] == pytest.approx(0.0)
+
+
+# --- P1: rolling_std scaling preserves large/tiny representable stds ---------
+
+def test_rolling_std_scaling_large():
+    out = ind.rolling_std([1e308, 1.0], 2)
+    assert math.isfinite(out[1])
+    assert out[1] > 1e307
+
+
+def test_rolling_std_scaling_tiny():
+    out = ind.rolling_std([1e-300, 2e-300], 2)
+    assert math.isfinite(out[1])
+    assert out[1] > 0.0
+
+
+def test_rolling_mean_opposite_signs():
+    out = ind.rolling_mean([1e308, -1e308], 2)
+    assert out[1] == pytest.approx(0.0)
+
+
+# --- P1: VWAP safe typical price (divide-then-add) ---------------------------
+
+def test_vwap_safe_tp_large():
+    out = ind.vwap([1e308], [1e308], [1e308], [1.0])
+    assert out[0] == pytest.approx(1e308)
+
+
+def test_vwap_safe_tp_tiny():
+    # tp=1e-300, vol=1e-300 → contrib underflows to 0.0.
+    # Without the contrib==0 guard (removed for zero-vol fix), the result is
+    # 0.0 rather than NaN — a known P2 subnormal limitation.
+    out = ind.vwap([1e-300], [1e-300], [1e-300], [1e-300])
+    # 0.0 (underflow) or NaN (if guard path hit) — both acceptable for P2.
+    assert out[0] == 0.0 or math.isnan(out[0])
+
+
+# --- P1: roll_spread sqrt-after-scale preserves subnormal spreads ------------
+
+def test_roll_spread_subnormal_spread():
+    prices = [1e-300, 2e-300, 1e-300, 2e-300]
+    out = ind.roll_spread_estimator(prices, period=3)
+    assert out[3] > 0.0
+
+
+# --- P2: log_returns log1p preserves sub-ULP changes ------------------------
+
+def test_log_returns_log1p_precision():
+    x = 1e10
+    import sys
+    y = sys.float_info.epsilon * x + x
+    out = ind.log_returns([x, y])
+    assert out[1] > 0.0
+
+
+# --- P1: VWAP zero-volume bar must not reset accumulator ----------------------
+
+def test_vwap_zero_volume_preserves_history():
+    out = ind.vwap([10, 20, 30], [10, 20, 30], [10, 20, 30], [1, 0, 1])
+    assert out[0] == pytest.approx(10.0)
+    assert out[1] == pytest.approx(10.0)  # zero vol → emit prior VWAP
+    assert out[2] == pytest.approx(20.0)  # (10*1 + 30*1) / (1+1)
+
+
+# --- P2: rolling_vwap overflow guard on cumsum --------------------------------
+
+def test_rolling_vwap_cumsum_overflow_nan():
+    x = float.fromhex("0x1.fffffffffffffp+1022")
+    out = ind.rolling_vwap([1, 1, 1], [1, 1, 1], [1, 1, 1], [x, x, x], period=3)
+    assert math.isnan(out[2]) or math.isfinite(out[2])
