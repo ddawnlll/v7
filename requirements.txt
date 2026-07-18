@@ -1,13 +1,18 @@
 # v7 lab dependencies.
 #
-# Exact pins are frozen from the remote box (the execution environment) during
-# lock verification, not guessed locally. Workflow: install this in a clean
-# venv on the remote box, `pip freeze` the result, then replace the bare names
-# below with the exact versions in the commit that becomes the recorded
-# authority SHA. A clean checkout must reproduce that pinned environment.
+# Exact versions frozen from the remote box (Linux, CPython 3.12.3) during
+# Phase 0/1 lock verification. A clean checkout must reproduce this environment:
+#   python3 -m venv .venv && . .venv/bin/activate
+#   pip install -r requirements.txt && python -m pytest lab/tests/ -q
 
 # Runtime — imported by lab/indicators.py
-numpy
+numpy==2.5.1
 
-# Test — required to run lab/tests/
-pytest
+# Test runner — required to run lab/tests/
+pytest==9.1.1
+
+# Transitive (pinned for reproducibility; pulled in by pytest)
+iniconfig==2.3.0
+packaging==26.2
+pluggy==1.6.0
+Pygments==2.20.0
