@@ -5,6 +5,13 @@ All the actual work lives in tools/load_snapshot.py (I/O + re-verification)
 and lab/observe.py (pure measurement) — this file only wires the two
 together and prints/writes the result.
 
+This CLI decides on every 5m bar (ARCHITECTURE §9.1's V0 event definition)
+— a plumbing/sanity baseline proving the data and simulator are honest, not
+the official Stage B interval-geometry result (§8.1's "primary decision
+candidate: 1h", derived via §8.3's 5m->15m/1h/4h aggregation). The output
+is labeled `observation_purpose: "plumbing_sanity_baseline"` /
+`official_hunter_geometry: false` so it can't be mistaken for the latter.
+
 Run:  python3 tools/run_observation.py --snapshot-dir data/snapshots/okx-btc-usdt-swap-5m-1776698400000-1784474400000
 """
 
@@ -32,6 +39,17 @@ def main() -> None:
     output = {
         "phase": 3,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        # This CLI runs every 5m bar as a candidate decision (ARCHITECTURE
+        # §9.1's V0 event definition), not the §8.1 "primary decision
+        # candidate: 1h" Hunter geometry. It's a plumbing/sanity baseline —
+        # proves the data + simulator are honest (near-zero zero-cost
+        # expectancy, no lookahead, no double-counted costs) — not the
+        # official Stage B interval-geometry result. Do not read this as an
+        # edge finding at any interval.
+        "decision_interval": "5m",
+        "simulation_interval": "5m",
+        "observation_purpose": "plumbing_sanity_baseline",
+        "official_hunter_geometry": False,
         "source_manifest": {
             "inst_id": loaded.manifest["inst_id"],
             "bar": loaded.manifest["bar"],
