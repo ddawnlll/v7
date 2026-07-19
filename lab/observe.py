@@ -98,7 +98,25 @@ def observe(
 
     atr = indicators.compute_atr(highs, lows, closes, period=ATR_PERIOD)
 
-    report: dict = {}
+    # Cost assumptions come from sim.TradeSpec's own declared defaults
+    # (source of truth is sim.py, not duplicated here) — recorded explicitly
+    # so a reader never has to reverse-engineer which fee/slippage was used.
+    _default_fee_rate = sim.TradeSpec.__dataclass_fields__["fee_rate"].default
+    _default_slippage_bps = sim.TradeSpec.__dataclass_fields__["slippage_bps"].default
+    cost_assumptions = {
+        "fee_rate_per_side": _default_fee_rate,
+        "slippage_bps_per_side": _default_slippage_bps,
+        "round_trip_fee_bps": 2 * _default_fee_rate * 10_000,
+        "round_trip_slippage_bps": 2 * _default_slippage_bps,
+        "funding": "real historical OKX funding events from the snapshot "
+                   "(variable, not a fixed assumption — applies only when "
+                   "the trade's holding period crosses a settlement)",
+        "source": "lab.sim.TradeSpec defaults (single authority, RULES §4) "
+                  "— not venue-specific; the snapshot's price data is OKX, "
+                  "these are sim.py's own declared per-side cost constants",
+    }
+
+    report: dict = {"cost_assumptions": cost_assumptions}
     for setup in setups:
         n_candidates = 0
         n_atr_unavailable = 0
@@ -110,6 +128,9 @@ def observe(
         net_r_values: list[float] = []
         zero_cost_net_r_values: list[float] = []
         hold_bars_values: list[int] = []
+        fee_r_values: list[float] = []
+        slippage_r_values: list[float] = []
+        funding_r_values: list[float] = []
 
         last_entry_i = n - setup.max_holding_bars - 2
         for i in range(ATR_PERIOD, max(ATR_PERIOD, last_entry_i + 1)):
@@ -153,6 +174,12 @@ def observe(
                 # required cost-sensitivity evidence, no second simulation).
                 zero_cost_net_r_values.append(outcome.gross_return / outcome.risk_fraction)
                 hold_bars_values.append(outcome.exit_index - outcome.entry_index)
+                # Cost components in R units (same normalization as net_r),
+                # so fee_R + slippage_R is directly "round-trip cost as a
+                # fraction of the ATR stop distance" the reviewer asked for.
+                fee_r_values.append(outcome.costs.fee / outcome.risk_fraction)
+                slippage_r_values.append(outcome.costs.slippage / outcome.risk_fraction)
+                funding_r_values.append(outcome.costs.funding / outcome.risk_fraction)
 
                 if outcome.exit_reason in ("stop", "target"):
                     stop_touched, target_touched = _touches(
@@ -180,6 +207,9 @@ def observe(
             "mfe_r": _percentiles(mfe_r_values),
             "net_r_realistic_cost": _percentiles(net_r_values),
             "net_r_zero_cost": _percentiles(zero_cost_net_r_values),
+            "fee_r": _percentiles(fee_r_values),
+            "slippage_r": _percentiles(slippage_r_values),
+            "funding_r": _percentiles(funding_r_values),
             "hold_bars": _percentiles(hold_bars_values),
         }
 

@@ -12,6 +12,8 @@ max_holding_bars + 2) so there is exactly one (LONG, SHORT) pair to reason
 about by hand, then engineers the single outcome-scan bar to produce a
 specific, predictable exit.
 """
+import pytest
+
 from lab.data import Bar
 from lab.observe import ATR_PERIOD, Setup, observe
 
@@ -88,6 +90,30 @@ def test_zero_cost_net_r_never_worse_than_realistic_cost():
     bars = _with_outcome_bars({16: (105.0, 99.0)})
     report = observe(bars, setups=(_SETUP,))["test"]
     assert report["net_r_zero_cost"]["mean"] >= report["net_r_realistic_cost"]["mean"]
+
+
+def test_cost_components_sum_to_the_zero_vs_realistic_delta():
+    # fee_R + slippage_R + funding_R must exactly account for the gap
+    # between zero-cost and realistic-cost net_r (net_return = execution_
+    # return - costs.total, both normalized by the same risk_fraction) —
+    # an accounting identity, not a statistical approximation.
+    bars = _with_outcome_bars({16: (105.0, 99.0)})
+    report = observe(bars, setups=(_SETUP,))["test"]
+    delta = report["net_r_zero_cost"]["mean"] - report["net_r_realistic_cost"]["mean"]
+    cost_sum = (
+        report["fee_r"]["mean"] + report["slippage_r"]["mean"] + report["funding_r"]["mean"]
+    )
+    assert cost_sum == pytest.approx(delta, abs=1e-9)
+
+
+def test_cost_assumptions_match_sim_tradespec_defaults():
+    bars = _with_outcome_bars({16: (105.0, 99.0)})
+    report = observe(bars, setups=(_SETUP,))
+    ca = report["cost_assumptions"]
+    assert ca["fee_rate_per_side"] == 0.0004
+    assert ca["slippage_bps_per_side"] == 1.0
+    assert ca["round_trip_fee_bps"] == pytest.approx(8.0)
+    assert ca["round_trip_slippage_bps"] == pytest.approx(2.0)
 
 
 def test_too_short_series_yields_no_candidates_not_a_crash():
