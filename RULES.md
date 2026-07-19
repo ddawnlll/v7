@@ -82,3 +82,19 @@ outcomes. Nothing else in the repo computes money. Inside `lab/sim.py`:
   determinism test: same result on the operator's box and the remote box).
 - One reference engine (scalar, readable, hand-verifiable) defines truth. Any faster path
   (vectorized tape, CUDA) is parity-gated against the reference and is never the sole path.
+
+## 15. Remote execution discipline
+The remote box has exactly one working directory (`~/v7`). No second clone, bundle, or
+extract is left there for a spot-check — if a throwaway copy is ever needed for a one-off
+comparison, it's deleted before the session ends. Ad hoc clones accumulate silently and
+create doubt about which commit was actually verified.
+
+Local is the sole source of truth. A one-way Mutagen sync (`sync-mode: one-way-replica`,
+alpha = local repo including `.git`, beta = remote `~/v7`) keeps them identical; a direct
+edit made on the remote is reverted, not merged — the remote is a mirror, never an editor.
+This is why `git tag`/`git log` on the remote always match local without a manual `git
+pull`: the sync carries `.git` itself, not just the working tree.
+
+This does not relax §11: the operator still runs the verify command on the remote box and
+sees it pass themselves. The sync only guarantees that "the code I have locally" and "the
+code the remote is testing" are never two different things.
