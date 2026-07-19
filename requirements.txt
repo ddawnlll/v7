@@ -8,6 +8,12 @@
 # Runtime — imported by lab/indicators.py
 numpy==2.5.1
 
+# Runtime — parquet I/O for tools/build_snapshot.py (ARCHITECTURE.md Sec 8.2).
+# lab/data.py never imports this: the deterministic core hashes canonical text,
+# never parquet container bytes (not writer-stable). Only the acquisition tool
+# touches pyarrow.
+pyarrow==25.0.0
+
 # Test runner — required to run lab/tests/
 pytest==9.1.1
 
