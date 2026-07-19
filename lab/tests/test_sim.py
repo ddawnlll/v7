@@ -430,3 +430,77 @@ def test_frozen_canonical_outcome_hash():
     assert out.outcome_hash == (
         "17ca5e2c7b99ba36d5edc1eff7afdcd85f06b77023252b11953a23559b029364"
     )
+
+
+# --- post-exit bar mutation invariance (roadmap Phase 1 evidence) -------------
+
+def test_post_exit_bar_mutation_does_not_change_outcome():
+    """Bars after the exit index are never inspected: mutating them must not
+    change the outcome or its hash. This asserts the invariance directly, not
+    just that a NaN post-exit bar is tolerated (test_lazy_bar_validation)."""
+    opens = [100, 100, 109, 100, 100, 100]
+    highs = [100, 105, 111, 100, 100, 100]
+    lows = [100, 95, 108, 100, 100, 100]
+    closes = [100, 102, 110, 100, 100, 100]
+    base = simulate(opens, highs, lows, closes, _long())
+    assert base.exit_reason == "target" and base.exit_index == 2
+
+    # Replace every bar AFTER the exit (indices 3,4,5) with wildly different
+    # but structurally valid bars. Outcome and hash must be byte-identical.
+    o2 = opens[:3] + [999.0, 999.0, 999.0]
+    h2 = highs[:3] + [999.0, 999.0, 999.0]
+    l2 = lows[:3] + [999.0, 999.0, 999.0]
+    c2 = closes[:3] + [999.0, 999.0, 999.0]
+    mutated = simulate(o2, h2, l2, c2, _long())
+
+    assert mutated == base
+    assert mutated.outcome_hash == base.outcome_hash
+
+
+# --- LONG/SHORT mirror (roadmap Phase 1 evidence) ----------------------------
+
+def test_long_short_mirror_is_symmetric():
+    """Reflecting every price about the entry and flipping the side must
+    produce an identical economic outcome: same net_r, mae_r, mfe_r. Guards
+    against a directional sign asymmetry in returns, barriers or excursions."""
+    # LONG: target hit at bar 2.
+    l_opens = [100, 100, 109, 100, 100, 100]
+    l_highs = [100, 105, 111, 100, 100, 100]
+    l_lows = [100, 95, 108, 100, 100, 100]
+    l_closes = [100, 102, 110, 100, 100, 100]
+    long_out = simulate(l_opens, l_highs, l_lows, l_closes, _long())
+
+    # SHORT mirror about 100: price' = 200 - price, and high<->low swap.
+    s_opens = [100, 100, 91, 100, 100, 100]     # 200 - open
+    s_highs = [100, 105, 92, 100, 100, 100]     # 200 - low
+    s_lows = [100, 95, 89, 100, 100, 100]       # 200 - high
+    s_closes = [100, 98, 90, 100, 100, 100]     # 200 - close
+    short_spec = TradeSpec(
+        side="SHORT", entry_index=0, entry_price=100.0,
+        stop_price=110.0, target_price=90.0, max_holding_bars=5, **ZERO,
+    )
+    short_out = simulate(s_opens, s_highs, s_lows, s_closes, short_spec)
+
+    assert short_out.exit_reason == "target" and short_out.exit_index == 2
+    assert short_out.net_r == pytest.approx(long_out.net_r)
+    assert short_out.mae_r == pytest.approx(long_out.mae_r)
+    assert short_out.mfe_r == pytest.approx(long_out.mfe_r)
+
+
+# --- extra MAE/MFE golden: timeout exit with two-sided excursion -------------
+
+def test_mae_mfe_golden_on_timeout():
+    """Second hand-computed excursion case: neither barrier hit, time exit at
+    the last bar. Excursions accumulate over every held bar (1..5)."""
+    opens = [100, 101, 103, 102, 101, 100]
+    highs = [100, 106, 108, 104, 103, 102]   # max high over 1..5 = 108
+    lows = [100, 97, 99, 96, 98, 99]         # min low over 1..5 = 96
+    closes = [100, 102, 104, 101, 100, 100]
+    out = simulate(opens, highs, lows, closes, _long(target_price=130.0))
+    assert out.exit_reason == "time"
+    assert out.exit_index == 5
+    # risk = (100-90)/100 = 0.10; mfe = (108-100)/100 / 0.10 = 0.8
+    assert out.mfe_r == pytest.approx(0.8)
+    # mae = (100-96)/100 / 0.10 = 0.4
+    assert out.mae_r == pytest.approx(0.4)
+    assert out.net_r == pytest.approx(0.0)  # close returns to 100
