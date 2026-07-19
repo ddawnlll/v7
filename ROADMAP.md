@@ -20,16 +20,34 @@ A poor research result is never permission to rewrite a validated lower layer.
 
 ## Current status
 
-**NOW:** Phase 2 — one verified market-data snapshot.
+**NOW:** Phase 3 — outcome observation on the verified snapshot.
 
-**NEXT:** Phase 3 — outcome observation on the verified snapshot.
+**NEXT:** Phase 4 — outcome contract.
 
 **LOCKED:** Research hypotheses, models, execution policies, RL, live trading,
 and hardware acceleration.
 
 Phase 0 (indicator) and Phase 1 (simulation) authorities are recorded as the
 `indicator-authority` and `simulation-authority` git tags, both at the verified
-commit whose full suite passes from a clean checkout on the execution box.
+commit whose full suite passes from a clean checkout on the execution box
+(commit `8117950`, 227/227 tests, remote box, CPython 3.12.3).
+
+Phase 2 exited — one immutable dataset snapshot recorded:
+
+* Source: OKX, `BTC-USDT-SWAP`, `5m` bar
+* Window: `[1776698400000, 1784474400000)` ms epoch
+  (`2026-04-20T15:20:00Z` – `2026-07-19T15:20:00Z`, 90 days)
+* Build command: `python3 tools/build_snapshot.py --start-ts 1776698400000 --end-ts 1784474400000`
+* `trade_dataset_hash`: `d08d100a35de8f8c65d6502d8e236aa7fb88626e4b2a398a20fe3a4a0a4c123a`
+* `mark_dataset_hash`: `bb4d118460ecbb8580344bc9b9883558d1e4d4fa983b03c9c3d77f7482d059a9`
+* `funding_dataset_hash`: `89dbf4481b57025a727b96cfdff412aed4fec0499f1c1eb8e3f12595bea3959c`
+* `instrument_hash`: `23d6876bc2533ce4f04aafa23a469285d02493f01b28a0dce277923b1a381d23`
+* `coverage_complete: true` (trade + mark, 25,920/25,920 bars each), `gap_count: 0` (both)
+* Reproduced 3 times across independent live fetches on the execution box —
+  identical hashes each time
+* Snapshot files live at `data/snapshots/` on the execution box (gitignored,
+  not committed — see RULES §15); the manifest above is the recorded,
+  rerunnable evidence per this phase's exit requirement
 
 ---
 

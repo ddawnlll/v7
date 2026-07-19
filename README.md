@@ -27,4 +27,4 @@ salvage/          Code copied from v7-engine. UNAUDITED. Quarantined — see RUL
 
 ## Status
 
-Phase 0 (indicator authority) and Phase 1 (simulation authority) hardened; lock verification — the full suite from a clean checkout on the remote box — is pending before each authority SHA is recorded. See [ROADMAP.md](ROADMAP.md). Rules of the house: [RULES.md](RULES.md).
+Phase 0 (indicator authority) and Phase 1 (simulation authority) locked: 227/227 tests pass from a clean checkout on the remote box, `indicator-authority`/`simulation-authority` tags recorded at commit `8117950`. Phase 2 (verified data snapshot) exited: one immutable BTC-USDT-SWAP 5m snapshot built and hash-verified, reproduced across independent live fetches. Now in Phase 3 (outcome observation). See [ROADMAP.md](ROADMAP.md) for the evidence. Rules of the house: [RULES.md](RULES.md).
