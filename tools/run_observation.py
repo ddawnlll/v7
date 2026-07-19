@@ -5,14 +5,22 @@ All the actual work lives in tools/load_snapshot.py (I/O + re-verification)
 and lab/observe.py (pure measurement) — this file only wires the two
 together and prints/writes the result.
 
-This CLI decides on every 5m bar (ARCHITECTURE §9.1's V0 event definition)
-— a plumbing/sanity baseline proving the data and simulator are honest, not
-the official Stage B interval-geometry result (§8.1's "primary decision
-candidate: 1h", derived via §8.3's 5m->15m/1h/4h aggregation). The output
-is labeled `observation_purpose: "plumbing_sanity_baseline"` /
-`official_hunter_geometry: false` so it can't be mistaken for the latter.
+Two ``--setups`` modes, writing two different files so neither is ever
+mistaken for the other:
+
+``baseline`` (default) decides on every 5m bar (ARCHITECTURE §9.1's V0
+event definition) — a plumbing/sanity baseline proving the data and
+simulator are honest, not the official interval geometry. Writes
+``observations.json``. Labeled `observation_purpose:
+"plumbing_sanity_baseline"` / `official_hunter_geometry: false`.
+
+``stage_b`` decides at 15m/1h/4h (ARCHITECTURE §8.1's "primary decision
+candidate: 1h", derived via §8.3's 5m->15m/1h/4h aggregation), same three
+economic horizons as baseline. Writes ``observations_stage_b.json``. Still
+`official_hunter_geometry: false` — exploratory, not a locked HunterSpec.
 
 Run:  python3 tools/run_observation.py --snapshot-dir data/snapshots/okx-btc-usdt-swap-5m-1776698400000-1784474400000
+      python3 tools/run_observation.py --snapshot-dir ... --setups stage_b
 """
 
 from __future__ import annotations
@@ -27,28 +35,44 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lab import observe as observe_module  # noqa: E402
 from tools import load_snapshot  # noqa: E402
 
+_MODES = {
+    "baseline": {
+        "setups": observe_module.DEFAULT_SETUPS,
+        "out_filename": "observations.json",
+        "decision_interval": "5m",
+        "observation_purpose": "plumbing_sanity_baseline",
+    },
+    "stage_b": {
+        "setups": observe_module.STAGE_B_SETUPS,
+        "out_filename": "observations_stage_b.json",
+        "decision_interval": "15m/1h/4h",
+        "observation_purpose": "stage_b_interval_geometry",
+    },
+}
+
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--snapshot-dir", type=Path, required=True)
+    p.add_argument("--setups", choices=sorted(_MODES), default="baseline")
     args = p.parse_args()
 
+    mode = _MODES[args.setups]
     loaded = load_snapshot.load(args.snapshot_dir)
-    report = observe_module.observe(loaded.trade_bars, loaded.funding_events)
+    report = observe_module.observe(
+        loaded.trade_bars, loaded.funding_events, setups=mode["setups"]
+    )
 
     output = {
         "phase": 3,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        # This CLI runs every 5m bar as a candidate decision (ARCHITECTURE
-        # §9.1's V0 event definition), not the §8.1 "primary decision
-        # candidate: 1h" Hunter geometry. It's a plumbing/sanity baseline —
-        # proves the data + simulator are honest (near-zero zero-cost
-        # expectancy, no lookahead, no double-counted costs) — not the
-        # official Stage B interval-geometry result. Do not read this as an
-        # edge finding at any interval.
-        "decision_interval": "5m",
+        # Simulation always walks the 5m tape (ARCHITECTURE §8.2); only
+        # decision_interval (which bars count as decisions) differs between
+        # modes. Neither mode is a locked HunterSpec — see the module
+        # docstring for what each is and isn't.
+        "decision_interval": mode["decision_interval"],
         "simulation_interval": "5m",
-        "observation_purpose": "plumbing_sanity_baseline",
+        "observation_purpose": mode["observation_purpose"],
         "official_hunter_geometry": False,
         "source_manifest": {
             "inst_id": loaded.manifest["inst_id"],
@@ -63,7 +87,7 @@ def main() -> None:
         "setups": report,
     }
 
-    out_path = args.snapshot_dir / "observations.json"
+    out_path = args.snapshot_dir / mode["out_filename"]
     out_path.write_text(json.dumps(output, indent=2, sort_keys=True))
 
     print(json.dumps(output, indent=2, sort_keys=True))

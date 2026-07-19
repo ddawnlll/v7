@@ -83,23 +83,24 @@ def test_timeout_when_neither_barrier_touched():
     assert report["hold_bars"]["mean"] == _SETUP.max_holding_bars
 
 
-def test_zero_cost_net_r_never_worse_than_realistic_cost():
+def test_zero_cost_net_r_never_worse_than_all_taker_conservative():
     # Costs only ever subtract from execution_return (RULES: fee_rate,
     # slippage_bps > 0 by default) -> zero-cost net_r >= realistic net_r,
     # for every setup, always.
     bars = _with_outcome_bars({16: (105.0, 99.0)})
     report = observe(bars, setups=(_SETUP,))["test"]
-    assert report["net_r_zero_cost"]["mean"] >= report["net_r_realistic_cost"]["mean"]
+    assert report["net_r_zero_cost"]["mean"] >= report["net_r_all_taker_conservative"]["mean"]
 
 
-def test_cost_components_sum_to_the_zero_vs_realistic_delta():
+def test_cost_components_sum_to_the_zero_vs_all_taker_delta():
     # fee_R + slippage_R + funding_R must exactly account for the gap
-    # between zero-cost and realistic-cost net_r (net_return = execution_
-    # return - costs.total, both normalized by the same risk_fraction) —
-    # an accounting identity, not a statistical approximation.
+    # between zero-cost and all-taker-conservative net_r (net_return =
+    # execution_return - costs.total, both normalized by the same
+    # risk_fraction) — an accounting identity, not a statistical
+    # approximation.
     bars = _with_outcome_bars({16: (105.0, 99.0)})
     report = observe(bars, setups=(_SETUP,))["test"]
-    delta = report["net_r_zero_cost"]["mean"] - report["net_r_realistic_cost"]["mean"]
+    delta = report["net_r_zero_cost"]["mean"] - report["net_r_all_taker_conservative"]["mean"]
     cost_sum = (
         report["fee_r"]["mean"] + report["slippage_r"]["mean"] + report["funding_r"]["mean"]
     )
@@ -123,3 +124,86 @@ def test_too_short_series_yields_no_candidates_not_a_crash():
     assert report["n_simulated"] == 0
     assert report["coverage"] is None
     assert report["mae_r"]["mean"] is None
+
+
+# --- multi-interval decisioning (Stage B: decision_interval_factor > 1) -------
+#
+# Flat background bars aggregate (lab.data.aggregate) into flat 15m derived
+# bars with the same constant-TR trick as above: every derived bar's true
+# range is 2.0, so ATR(14) on the *derived* series is exactly 2.0 at
+# derived-index >= 14, hand-computable exactly like the 5m case.
+
+_STAGE_B_SETUP = Setup(
+    "test_15m", k_stop=1.0, reward_risk=2.0, max_holding_bars=3,
+    decision_interval_factor=3, decision_interval_label="15m",
+)
+# 45 flat 5m bars (0..44) = 15 complete 15m buckets -> derived ATR(14) valid
+# at derived-index 14 (bucket [42,43,44]), entry_index=45. Bars 45-47 also
+# happen to complete a 16th bucket (45 is itself bucket-aligned: 45 % 3 ==
+# 0) giving a *second* derived candidate at derived-index 15, entry_index=48
+# — deliberately left out of range (needs bars 49-51, which don't exist) so
+# this one array exercises both the mapping-succeeds and the
+# mapping-produces-an-out-of-range-candidate paths in the same hand-worked
+# example, rather than trying to (unavoidably) dodge the second bucket.
+_STAGE_B_N = 45 + 1 + _STAGE_B_SETUP.max_holding_bars  # = 49
+
+
+def test_multi_interval_decision_maps_to_correct_5m_entry_bar():
+    # Same dual-sided target/stop pattern as test_target_then_stop_
+    # unambiguous, just at a 15m decision interval: bar46 (the first
+    # outcome-scan bar after the mapped 5m entry) engineered identically.
+    bars = _flat_bars(_STAGE_B_N)
+    bars[46] = Bar(open_ts=bars[46].open_ts, open=100.0, high=105.0, low=99.0,
+                    close=100.0, volume=1.0)
+
+    report = observe(bars, setups=(_STAGE_B_SETUP,))["test_15m"]
+
+    assert report["decision_interval_factor"] == 3
+    assert report["decision_interval_label"] == "15m"
+    # Two derived decision points exist (derived-index 14 and 15); only the
+    # first maps to a usable 5m entry (45) whose 3-bar horizon fits in the
+    # 49-bar array — the second (entry=48) doesn't, see comment above.
+    assert report["n_candidates"] == 4
+    assert report["n_out_of_range"] == 2
+    assert report["n_atr_unavailable"] == 0
+    assert report["n_simulated"] == 2
+    assert report["coverage"] == 0.5
+    # Same engineered bar as the 5m case: LONG hits target, SHORT hits stop.
+    assert report["exit_reason_rate"]["target"] == 0.5
+    assert report["exit_reason_rate"]["stop"] == 0.5
+    assert report["hold_bars"]["mean"] == 1  # bar46 is 1 bar after entry (45)
+
+
+def test_multi_interval_decision_out_of_range_when_horizon_does_not_fit():
+    # Truncate right after the mapped entry bar (index 45) so bars 46-48
+    # (the 3-bar horizon) don't exist -> the one decision candidate must be
+    # reported as out-of-range, not silently dropped or crashed on.
+    bars = _flat_bars(46)  # indices 0..45 only
+    report = observe(bars, setups=(_STAGE_B_SETUP,))["test_15m"]
+
+    assert report["n_candidates"] == 2
+    assert report["n_out_of_range"] == 2
+    assert report["n_simulated"] == 0
+    assert report["coverage"] == 0.0
+
+
+def test_overlap_fraction_matches_decision_spacing_vs_horizon():
+    always_short = _flat_bars(ATR_PERIOD)  # no candidates either way; only
+    # overlap_fraction (a pure function of the Setup) is under test here.
+
+    every_bar = Setup("s", k_stop=1.0, reward_risk=1.0, max_holding_bars=12)
+    assert observe(always_short, setups=(every_bar,))["s"]["overlap_fraction"] \
+        == pytest.approx(1 - 1 / 12)
+
+    exactly_independent = Setup(
+        "s", k_stop=1.0, reward_risk=1.0, max_holding_bars=12,
+        decision_interval_factor=12, decision_interval_label="1h",
+    )
+    assert observe(always_short, setups=(exactly_independent,))["s"]["overlap_fraction"] == 0.0
+
+    spaced_wider_than_horizon = Setup(
+        "s", k_stop=1.0, reward_risk=1.0, max_holding_bars=12,
+        decision_interval_factor=48, decision_interval_label="4h",
+    )
+    # factor > max_holding_bars -> negative raw value, clamped to 0.
+    assert observe(always_short, setups=(spaced_wider_than_horizon,))["s"]["overlap_fraction"] == 0.0
