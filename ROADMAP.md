@@ -20,12 +20,16 @@ A poor research result is never permission to rewrite a validated lower layer.
 
 ## Current status
 
-**NOW:** Simulation truth-core hardening and lock verification.
+**NOW:** Phase 2 — one verified market-data snapshot.
 
-**NEXT:** One verified market-data snapshot.
+**NEXT:** Phase 3 — outcome observation on the verified snapshot.
 
 **LOCKED:** Research hypotheses, models, execution policies, RL, live trading,
 and hardware acceleration.
+
+Phase 0 (indicator) and Phase 1 (simulation) authorities are recorded as the
+`indicator-authority` and `simulation-authority` git tags, both at the verified
+commit whose full suite passes from a clean checkout on the execution box.
 
 ---
 
