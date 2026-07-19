@@ -18,6 +18,11 @@ parquet files are a storage container only; every dataset hash in the manifest
 is computed by lab/data.py over the CANONICAL TEXT form of the validated
 records, never over parquet bytes (not writer-stable — RULES §8).
 
+The four fetches (trade, mark, funding, instrument) hit independent OKX
+endpoints and share no state, so `build()` runs them concurrently. Pagination
+*within* one fetch stays sequential — OKX's `after` cursor is stateful, each
+page's request depends on the previous page's oldest timestamp.
+
 Run:  python3 tools/build_snapshot.py
       python3 tools/build_snapshot.py --inst-id ETH-USDT-SWAP --days 30
 """
@@ -31,6 +36,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -229,10 +235,20 @@ def build(
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    trade_rows = fetch_trade_candles(inst_id, bar, start_ts, end_ts)
-    mark_rows = fetch_mark_candles(inst_id, bar, start_ts, end_ts)
-    funding_rows = fetch_funding_history(inst_id, start_ts, end_ts)
-    instrument = fetch_instrument(inst_id)
+    # Four independent OKX endpoints, no shared state — fetch concurrently.
+    # .result() is called in the same order every time so a failure is
+    # reported deterministically (fail-closed, RULES §1), not by whichever
+    # thread happens to finish first.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        trade_future = pool.submit(fetch_trade_candles, inst_id, bar, start_ts, end_ts)
+        mark_future = pool.submit(fetch_mark_candles, inst_id, bar, start_ts, end_ts)
+        funding_future = pool.submit(fetch_funding_history, inst_id, start_ts, end_ts)
+        instrument_future = pool.submit(fetch_instrument, inst_id)
+
+        trade_rows = trade_future.result()
+        mark_rows = mark_future.result()
+        funding_rows = funding_future.result()
+        instrument = instrument_future.result()
 
     trade_bars = data.to_bars(to_trade_records(trade_rows, start_ts, end_ts), interval_ms)
     mark_bars = data.to_mark_bars(to_mark_records(mark_rows, start_ts, end_ts), interval_ms)
