@@ -57,7 +57,13 @@ and seen it pass. Claude's summary is not evidence; the command output is.
 
 ## 12. No process theater
 No ACCP reports, no lock ledgers, no phase ceremonies. Docs are: README, RULES, ROADMAP,
-and code comments that state constraints. Everything else is a test.
+ARCHITECTURE, and code comments that state constraints. Everything else is a test.
+
+ARCHITECTURE was added because the authority-boundary map (which file owns which
+economic/causal decision, RULES §4) grew too large to keep solely in ROADMAP's
+phase-gated language without either bloating ROADMAP or losing the map entirely.
+It describes structure and boundaries, never phase status — status stays in
+ROADMAP's "Current status" section, not duplicated here.
 
 ## 13. Minimal file surface
 Prefer the fewest files that keep each file independently auditable. A file earns its
