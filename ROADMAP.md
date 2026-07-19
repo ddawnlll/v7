@@ -395,6 +395,106 @@ tests. It never becomes the sole economic truth implementation.
 
 ---
 
+## Evaluation split discipline
+
+### 75/25 is not a scientific law or financial standard
+
+The commonly used 75/25 (or 80/20, 70/15/15) split ratios are practical
+starting templates, not universally mandated rules.
+
+**General ML resources** (Google for Developers) show 80/20 as an example and
+70/15/15 as a better practice, but explicitly state these are not mandatory
+percentages — the test set must simply be large enough, statistically meaningful,
+and representative of real usage data.
+
+**Time series resources** (scikit-learn `TimeSeriesSplit`) recommend no specific
+percentage. The core rules are:
+
+- Split chronologically
+- Never train on future data to predict the past
+- Train set grows from the past while a later time segment is tested
+
+**Finance literature** notes that financial data is not independent — adjacent
+rows may have overlapping feature and label windows. Standard K-fold or random
+splits can be misleading. Purged cross-validation (removing overlapping labels
+from train) and embargo (reducing near-term dependency) are recommended over
+any fixed percentage.
+
+### Correct split architecture
+
+```
+ALL TIME SERIES
+│
+├── DEVELOPMENT
+│   ├── purged walk-forward fold 1
+│   ├── purged walk-forward fold 2
+│   ├── purged walk-forward fold 3
+│   └── feature, label, threshold and model selection
+│
+└── FROZEN TEST
+    └── only final OOS evaluation
+```
+
+### Correct contract
+
+Replace a fixed percentage with:
+
+```yaml
+split:
+  ordering: chronological
+  development: all observations before frozen_test_start
+  frozen_test: observations from frozen_test_start onward
+  purge_by: outcome_end_ts
+  test_size_rule: predeclared_before_modeling
+```
+
+### What frozen test size must satisfy
+
+For Hunter, the test partition must satisfy:
+
+1. **Sufficient independent trade events.** Tens of thousands of candles alone
+   is insufficient; if Hunter selects only 15 trades the test is weak.
+2. **Sufficiently long calendar span.** 100 trades from the same three-day
+   volatility burst are not 100 independent pieces of evidence.
+3. **Never used during model development.**
+4. **Should ideally span multiple market regimes.** However, looking at the test
+   period and adjusting its boundary constitutes test contamination — the date
+   boundary must be pre-recorded.
+5. **Outcome overlap is purged.** Any train row whose label uses prices after
+   the test start must be removed from the training set.
+
+### First-pass guideline
+
+For the initial dataset pass:
+
+1. Verify the total available date range
+2. Set aside the latest portion as a frozen holdout
+3. Record the split timestamp in the manifest
+4. Use the remaining development period for geometry analysis
+5. Use purged walk-forward validation inside development
+6. Do not touch the frozen partition during feature, label, or model selection
+
+A first-pass choice of roughly the final 20–25% is a reasonable engineering
+default, described as:
+
+> **Initial holdout preference — not a scientifically mandatory ratio.**
+
+For example, with four years of data: first 3 years → development, last 1 year
+→ frozen test (~75/25). But with only eight months of data, the last two months
+may not provide sufficient evidence. With ten years of data, reserving the last
+2.5 years may waste too much training data.
+
+### What the roadmap must say
+
+The roadmap must not lock a fixed percentage before Hunter's geometry (base
+rate, annual candidate count, average holding horizon) is known. The correct
+statement is:
+
+> Frozen test size: TBD by a predeclared evidence requirement,
+> before feature, label, threshold or model selection.
+
+---
+
 ## Roadmap discipline
 
 Only the **NOW** phase contains implementation detail.
