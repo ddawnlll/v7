@@ -20,6 +20,7 @@ ORDER = [
     "lab/indicators.py",
     "lab/events.py",
     "lab/evaluate.py",
+    "lab/features.py",
     "tools/data.py",
     "tools/download_binance.py",
 ]
