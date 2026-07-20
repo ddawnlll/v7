@@ -551,13 +551,13 @@ def test_rejects_negative_entry_index():
 
 def test_rejects_funding_with_non_finite_mark_price():
     flat = _flat6()
-    bad_funding = [sim.FundingEvent(bar_index=1, rate=0.0001, mark_price=float("nan"))]
+    bad_funding = [FundingEvent(bar_index=1, rate=0.0001, mark_price=float("nan"))]
     with pytest.raises(ValueError, match="mark_price"):
         simulate(flat, flat, flat, flat, _long(), bad_funding)
 
 
 def test_rejects_funding_with_zero_mark_price():
     flat = _flat6()
-    bad_funding = [sim.FundingEvent(bar_index=1, rate=0.0001, mark_price=0.0)]
+    bad_funding = [FundingEvent(bar_index=1, rate=0.0001, mark_price=0.0)]
     with pytest.raises(ValueError, match="mark_price"):
         simulate(flat, flat, flat, flat, _long(), bad_funding)
