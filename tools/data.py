@@ -558,6 +558,15 @@ def load(snapshot_dir: Path) -> LoadedSnapshot:
     silently attach the wrong settlement price if the two tapes drifted)."""
     manifest = json.loads((snapshot_dir / "manifest.json").read_text())
 
+    if "instrument_id" not in manifest:
+        raise ValueError(f"{snapshot_dir}: manifest missing required 'instrument_id' field")
+    if "source" not in manifest:
+        raise ValueError(f"{snapshot_dir}: manifest missing required 'source' field")
+    if "bar" not in manifest:
+        raise ValueError(f"{snapshot_dir}: manifest missing required 'bar' field")
+    if "requested_start_ts" not in manifest or "requested_end_ts" not in manifest:
+        raise ValueError(f"{snapshot_dir}: manifest missing required window fields")
+
     if not manifest["trade"]["coverage_complete"]:
         raise ValueError(
             f"{snapshot_dir}: trade tape coverage_complete=false — refusing "

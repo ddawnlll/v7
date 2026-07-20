@@ -504,3 +504,60 @@ def test_mae_mfe_golden_on_timeout():
     # mae = (100-96)/100 / 0.10 = 0.4
     assert out.mae_r == pytest.approx(0.4)
     assert out.net_r == pytest.approx(0.0)  # close returns to 100
+
+
+# --- validation branch coverage (mutation gate no_test holds) ------------------
+
+def test_rejects_zero_or_negative_prices():
+    flat = _flat6()
+    for bad in [0.0, -1.0]:
+        with pytest.raises(ValueError, match="prices must all be > 0"):
+            simulate(flat, flat, flat, flat, _long(entry_price=bad))
+        with pytest.raises(ValueError, match="prices must all be > 0"):
+            simulate(flat, flat, flat, flat, _long(stop_price=bad))
+        with pytest.raises(ValueError, match="prices must all be > 0"):
+            simulate(flat, flat, flat, flat, _long(target_price=bad))
+
+
+def test_rejects_non_finite_stop_price():
+    flat = _flat6()
+    with pytest.raises(ValueError, match="stop_price"):
+        simulate(flat, flat, flat, flat, _long(stop_price=float("nan")))
+
+
+def test_rejects_non_finite_target_price():
+    flat = _flat6()
+    with pytest.raises(ValueError, match="target_price"):
+        simulate(flat, flat, flat, flat, _long(target_price=float("inf")))
+
+
+def test_rejects_negative_slippage_bps():
+    flat = _flat6()
+    with pytest.raises(ValueError, match="slippage_bps"):
+        simulate(flat, flat, flat, flat, _long(slippage_bps=-1.0))
+
+
+def test_rejects_max_holding_bars_below_one():
+    flat = _flat6()
+    with pytest.raises(ValueError, match="max_holding_bars"):
+        simulate(flat, flat, flat, flat, _long(max_holding_bars=0))
+
+
+def test_rejects_negative_entry_index():
+    flat = _flat6()
+    with pytest.raises(ValueError, match="entry_index"):
+        simulate(flat, flat, flat, flat, _long(entry_index=-1))
+
+
+def test_rejects_funding_with_non_finite_mark_price():
+    flat = _flat6()
+    bad_funding = [sim.FundingEvent(bar_index=1, rate=0.0001, mark_price=float("nan"))]
+    with pytest.raises(ValueError, match="mark_price"):
+        simulate(flat, flat, flat, flat, _long(), bad_funding)
+
+
+def test_rejects_funding_with_zero_mark_price():
+    flat = _flat6()
+    bad_funding = [sim.FundingEvent(bar_index=1, rate=0.0001, mark_price=0.0)]
+    with pytest.raises(ValueError, match="mark_price"):
+        simulate(flat, flat, flat, flat, _long(), bad_funding)

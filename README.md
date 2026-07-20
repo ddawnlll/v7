@@ -16,7 +16,6 @@ lab/
 tools/
   data.py         OKX data acquisition — build, load, verify, observe, universe CLI
   download_binance.py  Binance data acquisition + compilation
-  build_universe.py    Multi-symbol parallel build
   export_llm.py        LLM context snapshot builder
 specs/
   hunter_candidate_v0.json   Locked HunterSpec V0 geometry (wide_1h)
@@ -34,6 +33,6 @@ Phase 0–5 locked. Now in **Phase 6** (first falsifiable hypothesis).
 - Phase 4: `outcome-contract-authority` tag — HunterSpec V0, 7/7 geometry gates
 - Phase 5: `evaluation-authority` tag — PredictionContext safety, TAKE/ABSTAIN, immutable ledger
 
-**285/285 tests pass** from clean checkout on remote box (CPython 3.12.3).
+**287/287 tests pass** from clean checkout on remote box (CPython 3.12.3).
 
 See [ROADMAP.md](ROADMAP.md) for evidence. Rules: [RULES.md](RULES.md).

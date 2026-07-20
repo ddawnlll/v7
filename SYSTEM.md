@@ -88,7 +88,7 @@ OKX API → tools/data.py → Parquet tapes + manifest
 Binance S3 → tools/download_binance.py → Parquet tapes + manifest
 ```
 
-`tools/build_universe.py` orchestrates parallel builds across symbols.
+`tools/data.py` orchestrates parallel builds across symbols.
 Data lives on the execution box at `data/snapshots/` (gitignored).
 
 **No synthetic data.** Missing bars are gaps, not zero-volume candles
