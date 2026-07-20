@@ -12,7 +12,7 @@ from unittest import mock
 import pytest
 
 from lab import market
-from tools import snapshot as sn
+from tools import data as sn
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tools import snapshot  # noqa: E402
+from tools import data  # noqa: E402
 
 # Standard universes defined in ARCHITECTURE §8.1.1
 UNIVERSES = {
@@ -49,7 +49,7 @@ def build_one(sym: str, start_ts: int, end_ts: int) -> None:
     print(f"  [START] Building snapshot for {sym}...")
     t0 = time.time()
     try:
-        manifest = snapshot.build(
+        manifest = data.build(
             inst_id=sym,
             bar="5m",
             start_ts=start_ts,

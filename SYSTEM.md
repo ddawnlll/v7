@@ -84,7 +84,7 @@ Tag: `evaluation-authority`.
 Two exchange sources, one target:
 
 ```
-OKX API → tools/snapshot.py → Parquet tapes + manifest
+OKX API → tools/data.py → Parquet tapes + manifest
 Binance S3 → tools/download_binance.py → Parquet tapes + manifest
 ```
 

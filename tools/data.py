@@ -745,8 +745,8 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="command")
 
-    # --- build subcommand ---
-    p_build = sub.add_parser("build", help="fetch, validate and persist a snapshot")
+    # --- build subcommand (OKX) ---
+    p_build = sub.add_parser("build", help="fetch OKX candles, validate and persist a snapshot")
     p_build.add_argument("--inst-id", default="BTC-USDT-SWAP")
     p_build.add_argument("--bar", default="5m", choices=list(INTERVAL_MS))
     p_build.add_argument("--days", type=int, default=90, help="window size when --start/--end omitted")
@@ -763,14 +763,52 @@ def main() -> None:
     p_observe.add_argument("--snapshot-dir", type=Path, required=True)
     p_observe.add_argument("--setups", choices=sorted(_OBSERVE_MODES), default="baseline")
 
+    # --- universe subcommand (OKX multi-symbol) ---
+    p_universe = sub.add_parser("universe", help="build OKX snapshots for a standard universe profile")
+    p_universe.add_argument("--profile", choices=["test", "early"], default="test")
+    p_universe.add_argument("--limit-symbols", type=int, default=None)
+    p_universe.add_argument("--days", type=int, default=None)
+    p_universe.add_argument("--workers", type=int, default=3)
+
     args = p.parse_args()
 
     if args.command == "build":
         _cmd_build(args)
     elif args.command == "observe":
         _cmd_observe(args)
+    elif args.command == "universe":
+        _cmd_universe(args)
     else:
         p.print_help()
+
+
+def _cmd_universe(args: argparse.Namespace) -> None:
+    """Delegate to build_universe.py logic."""
+    from tools.build_universe import UNIVERSES, END_TS, DAY_MS, build_one
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    conf = UNIVERSES[args.profile]
+    symbols = conf["symbols"]
+    if args.limit_symbols is not None:
+        symbols = symbols[:args.limit_symbols]
+    days = args.days if args.days is not None else conf["days"]
+    start_ts = END_TS - days * DAY_MS
+
+    print(f"Building universe profile={args.profile!r} ({len(symbols)} symbols, {days} days)")
+    t_start = time.time()
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(build_one, sym, start_ts, END_TS): sym for sym in symbols}
+        failed = False
+        for future in as_completed(futures):
+            sym = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                print(f"  [CRITICAL] {sym} failed: {e}")
+                failed = True
+    if failed:
+        sys.exit(1)
+    print(f"Universe build complete in {time.time() - t_start:.1f}s")
 
 
 if __name__ == "__main__":

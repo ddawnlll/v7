@@ -14,7 +14,7 @@ lab/
   events.py       Candidate-event authority — observe() + build_events()
   evaluate.py     Evaluation authority — baselines, negative controls, ledger
 tools/
-  snapshot.py     OKX data acquisition — build, load, verify, observe CLI
+  data.py         OKX data acquisition — build, load, verify, observe, universe CLI
   download_binance.py  Binance data acquisition + compilation
   build_universe.py    Multi-symbol parallel build
   export_llm.py        LLM context snapshot builder

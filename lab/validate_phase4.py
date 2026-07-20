@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lab import events, sim  # noqa: E402
 from lab.events import Setup  # noqa: E402
-from tools.snapshot import load  # noqa: E402
+from tools.data import load  # noqa: E402
 
 
 def _load_hunter_spec() -> Setup:
