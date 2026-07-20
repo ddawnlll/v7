@@ -19,8 +19,8 @@ from typing import Sequence
 import numpy as np
 
 from lab.events import CandidateEvent
-from lab.indicators import compute_atr
-from lab.market import Bar
+
+# Feature extraction belongs to lab/features.py — evaluate.py is a consumer.
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # types
@@ -82,71 +82,6 @@ class SplitEval:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# feature precomputation — O(n) one-pass per symbol
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def precompute_features(
-    bars: list[Bar],
-    decision_tss: Sequence[int],
-    atr_period: int = 14,
-) -> dict[int, np.ndarray]:
-    """Precompute causal feature vectors for a set of decision timestamps.
-
-    One O(n) pass over bars. Returns dict mapping decision_ts → feature vector.
-    Decision timestamps not found in bars get a zero vector.
-
-    Features: [return_1, return_3, return_12, atr_norm]
-    All computed from bars strictly before decision_ts (causal).
-    """
-    if not bars:
-        return {}
-
-    n = len(bars)
-    closes = np.array([b.close for b in bars], dtype=float)
-    highs = np.array([b.high for b in bars], dtype=float)
-    lows = np.array([b.low for b in bars], dtype=float)
-
-    # Precompute ATR once
-    atr = compute_atr(highs.tolist(), lows.tolist(), closes.tolist(), period=atr_period)
-    atr_arr = np.array(atr, dtype=float)
-
-    # Build open_ts → index map for O(1) lookup
-    ts_to_idx: dict[int, int] = {}
-    for i, b in enumerate(bars):
-        ts_to_idx[b.open_ts] = i
-
-    result: dict[int, np.ndarray] = {}
-    for ts in decision_tss:
-        bar_before_ts = ts - 300_000  # the bar that ends at decision_ts
-        idx = ts_to_idx.get(bar_before_ts, -1)
-
-        if idx < 0 or idx < atr_period:
-            result[ts] = np.zeros(4, dtype=float)
-            continue
-
-        def _ret(lookback: int) -> float:
-            if idx - lookback < 0:
-                return 0.0
-            ref = closes[idx - lookback]
-            if ref == 0.0:
-                return 0.0
-            return float((closes[idx] - ref) / ref)
-
-        return_1 = _ret(1)
-        return_3 = _ret(3)
-        return_12 = _ret(12)
-
-        atr_val = atr_arr[idx] if idx < len(atr_arr) else 0.0
-        atr_norm = float(atr_val / closes[idx]) if closes[idx] != 0.0 else 0.0
-        if not np.isfinite(atr_norm):
-            atr_norm = 0.0
-
-        result[ts] = np.array([return_1, return_3, return_12, atr_norm], dtype=float)
-
-    return result
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # evaluation
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -160,7 +95,7 @@ def _validate_split(event: CandidateEvent) -> None:
 
 def evaluate(
     events: Sequence[CandidateEvent],
-    features_by_ts: dict[str, dict[int, np.ndarray]],  # symbol → {ts → features}
+    features_by_event_id: dict[str, np.ndarray],
     predictor,  # callable: (PredictionContext) → bool
     *,
     seed: int,
@@ -185,13 +120,9 @@ def evaluate(
             _validate_split(event)
             if event.split != "train":
                 continue
-            sym_features = features_by_ts.get(event.symbol, {})
-            feats = sym_features.get(event.decision_ts)
+            feats = features_by_event_id.get(event.event_id)
             if feats is None:
-                raise KeyError(
-                    f"no precomputed features for {event.symbol} at "
-                    f"decision_ts={event.decision_ts} (event {event.event_id})"
-                )
+                raise KeyError(f"no features for event {event.event_id}")
             train_ctxs.append(PredictionContext(
                 event_id=event.event_id,
                 symbol=event.symbol,
@@ -210,13 +141,9 @@ def evaluate(
 
     for event in events:
         _validate_split(event)
-        sym_features = features_by_ts.get(event.symbol, {})
-        feats = sym_features.get(event.decision_ts)
+        feats = features_by_event_id.get(event.event_id)
         if feats is None:
-            raise KeyError(
-                f"no precomputed features for {event.symbol} at "
-                f"decision_ts={event.decision_ts} (event {event.event_id})"
-            )
+            raise KeyError(f"no features for event {event.event_id}")
 
         ctx = PredictionContext(
             event_id=event.event_id,
@@ -501,8 +428,8 @@ def make_tree_predictor(
 
 def shuffled_control_check(
     events: Sequence[CandidateEvent],
-    features_by_ts: dict[str, dict[int, np.ndarray]],
-    predictor_factory,  # callable: (train_ctxs, targets, seed) → predictor
+    features_by_event_id: dict[str, np.ndarray],
+    predictor_factory,
     seed: int,
     n_shuffles: int = 10,
 ) -> list[EvalMetrics]:
@@ -523,15 +450,12 @@ def shuffled_control_check(
     if len(train_events) < 2:
         return []
 
-    # Pre-build train contexts (features are fixed, only targets change)
+    # Pre-build train contexts from event_id-keyed features
     train_ctxs: list[PredictionContext] = []
     for e in train_events:
-        sym_f = features_by_ts.get(e.symbol, {})
-        feats = sym_f.get(e.decision_ts)
+        feats = features_by_event_id.get(e.event_id)
         if feats is None:
-            raise KeyError(
-                f"no features for {e.symbol} at ts={e.decision_ts}"
-            )
+            raise KeyError(f"no features for event {e.event_id}")
         train_ctxs.append(PredictionContext(
             event_id=e.event_id, symbol=e.symbol,
             side=e.side, decision_ts=e.decision_ts,
@@ -544,7 +468,7 @@ def shuffled_control_check(
         rng.shuffle(targets)
 
         predictor = predictor_factory(train_ctxs, targets, seed=seed + i)
-        result = evaluate(events, features_by_ts, predictor, seed=seed + i)
+        result = evaluate(events, features_by_event_id, predictor, seed=seed + i)
         results.append(result.test)  # evaluate on frozen test split
 
     return results
