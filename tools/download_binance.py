@@ -432,7 +432,8 @@ def compile_tapes(sym: str, start_ts: int, end_ts: int, months: list, days: list
     expected_bars = (end_ts - start_ts) // 300_000
     manifest = {
         "bar": "5m",
-        "symbol": sym,
+        "instrument_id": sym,
+        "source": "binance",
         "requested_start_ts": start_ts,
         "requested_end_ts": end_ts,
         "trade": {

@@ -22,7 +22,6 @@ ORDER = [
     "lab/evaluate.py",
     "tools/data.py",
     "tools/download_binance.py",
-    "tools/build_universe.py",
 ]
 
 SEPARATOR = "\n" + "# " + "─" * 72 + "\n"

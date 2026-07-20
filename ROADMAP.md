@@ -71,7 +71,7 @@ Phase 4 exited — outcome contract locked:
   - Valid coverage: 99.91% (≥ 99.5%)
   - Symbol consistency: 10/10 (≥ 8)
   Gate validation output: `data/snapshots/phase4_geometry_gates.json`.
-* **Code decoupling:** `lab/observe.py` is a pure consumer (no default setups;
+* **Code decoupling:** `lab/events.py` is a pure consumer (no default setups;
   `setups` parameter required). `lab/events.py` takes `split_ts` and `setup` as
   parameters — no hardcoded geometry or split constants. Specs live in
   versioned JSON: `specs/hunter_candidate_v0.json`, `specs/split_candidate_v0.json`.

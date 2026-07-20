@@ -32,7 +32,7 @@ LOAD
   the trade/mark/funding dataset hashes from the loaded rows via lab.data's
   own hashers and compares them against the manifest's recorded hashes, and
   refuses a snapshot whose manifest says its tape coverage was incomplete.
-  Nothing downstream (lab/observe.py) ever sees unverified bars.
+  Nothing downstream (lab/events.py) ever sees unverified bars.
 
 OBSERVE (CLI subcommand)
   Thin wrapper: load a verified snapshot, run lab.observe (Phase 3 outcome
@@ -399,7 +399,7 @@ def build(
         manifest = {
             "schema_version": "market-v0",
             "source": "okx",
-            "inst_id": inst_id,
+            "instrument_id": inst_id,
             "bar": bar,
             "requested_start_ts": start_ts,
             "requested_end_ts": end_ts,
@@ -454,7 +454,7 @@ def build(
 @dataclass(frozen=True, slots=True)
 class LoadedSnapshot:
     """A snapshot's contents, already hash-verified against its manifest and
-    ready to hand to lab/observe.py (or any other pure consumer)."""
+    ready to hand to lab/events.py (or any other pure consumer)."""
 
     trade_bars: list[tape.Bar]
     mark_bars: list[tape.MarkBar]
@@ -722,7 +722,7 @@ def _cmd_observe(args: argparse.Namespace) -> None:
         "observation_purpose": mode["observation_purpose"],
         "official_hunter_geometry": False,
         "source_manifest": {
-            "inst_id": loaded.manifest["inst_id"],
+            "instrument_id": loaded.manifest["instrument_id"],
             "bar": loaded.manifest["bar"],
             "requested_start_ts": loaded.manifest["requested_start_ts"],
             "requested_end_ts": loaded.manifest["requested_end_ts"],
@@ -783,9 +783,25 @@ def main() -> None:
 
 
 def _cmd_universe(args: argparse.Namespace) -> None:
-    """Delegate to build_universe.py logic."""
-    from tools.build_universe import UNIVERSES, END_TS, DAY_MS, build_one
+    """Build OKX snapshots for a standard universe profile in parallel."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    UNIVERSES = {
+        "test": {
+            "symbols": ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "XRP-USDT-SWAP"],
+            "days": 365,
+        },
+        "early": {
+            "symbols": [
+                "BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "XRP-USDT-SWAP",
+                "ADA-USDT-SWAP", "AVAX-USDT-SWAP", "DOGE-USDT-SWAP", "LINK-USDT-SWAP",
+                "DOT-USDT-SWAP", "NEAR-USDT-SWAP",
+            ],
+            "days": 1095,
+        },
+    }
+    END_TS = 1784474400000
+    DAY_MS = 86_400_000
 
     conf = UNIVERSES[args.profile]
     symbols = conf["symbols"]
@@ -794,21 +810,34 @@ def _cmd_universe(args: argparse.Namespace) -> None:
     days = args.days if args.days is not None else conf["days"]
     start_ts = END_TS - days * DAY_MS
 
-    print(f"Building universe profile={args.profile!r} ({len(symbols)} symbols, {days} days)")
+    def build_one(sym: str):
+        out_dir = Path(f"data/snapshots/okx-{sym.lower()}-5m-{start_ts}-{END_TS}")
+        if out_dir.exists():
+            print(f"  [SKIP] {sym}")
+            return
+        print(f"  [START] {sym}")
+        t0 = time.time()
+        try:
+            build(inst_id=sym, bar="5m", start_ts=start_ts, end_ts=END_TS, strict=True)
+            print(f"  [OK] {sym} ({time.time() - t0:.0f}s)")
+        except Exception as e:
+            print(f"  [FAIL] {sym}: {e}")
+            raise
+
+    print(f"Universe {args.profile!r}: {len(symbols)} symbols, {days} days")
     t_start = time.time()
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(build_one, sym, start_ts, END_TS): sym for sym in symbols}
+        futures = {pool.submit(build_one, s): s for s in symbols}
         failed = False
-        for future in as_completed(futures):
-            sym = futures[future]
+        for f in as_completed(futures):
             try:
-                future.result()
+                f.result()
             except Exception as e:
-                print(f"  [CRITICAL] {sym} failed: {e}")
+                print(f"  [CRITICAL] {futures[f]} failed: {e}")
                 failed = True
     if failed:
         sys.exit(1)
-    print(f"Universe build complete in {time.time() - t_start:.1f}s")
+    print(f"Done in {time.time() - t_start:.0f}s")
 
 
 if __name__ == "__main__":
