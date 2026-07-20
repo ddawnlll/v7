@@ -28,16 +28,17 @@ A poor research result is never permission to rewrite a validated lower layer.
 and hardware acceleration.
 
 Phase 0 (indicator) and Phase 1 (simulation) authorities are recorded as the
-`indicator-authority` and `simulation-authority` git tags, both at the verified
-commit whose full suite passes from a clean checkout on the execution box
-(commit `8117950`, 227/227 tests, remote box, CPython 3.12.3).
+`indicator-authority` and `simulation-authority` git tags, both at verified
+commits whose full suites pass from a clean checkout on the execution box
+(`indicator-authority` at `441f3a9`, `simulation-authority` at `d1fc0dd`,
+CPython 3.12.3).
 
 Phase 2 exited — one immutable dataset snapshot recorded:
 
 * Source: OKX, `BTC-USDT-SWAP`, `5m` bar
 * Window: `[1776698400000, 1784474400000)` ms epoch
   (`2026-04-20T15:20:00Z` – `2026-07-19T15:20:00Z`, 90 days)
-* Build command: `python3 tools/snapshot.py build --start-ts 1776698400000 --end-ts 1784474400000`
+* Build command: `python tools/data.py build --start-ts 1776698400000 --end-ts 1784474400000`
 * `trade_dataset_hash`: `d08d100a35de8f8c65d6502d8e236aa7fb88626e4b2a398a20fe3a4a0a4c123a`
 * `mark_dataset_hash`: `bb4d118460ecbb8580344bc9b9883558d1e4d4fa983b03c9c3d77f7482d059a9`
 * `funding_dataset_hash`: `89dbf4481b57025a727b96cfdff412aed4fec0499f1c1eb8e3f12595bea3959c`
@@ -257,7 +258,7 @@ shuffled labels without touching the frozen test split.
 *   **Feature precomputation:** ``precompute_features()`` — O(n) one-pass per
     symbol, O(1) dict lookup per event.
 *   **Deterministic reproduction:** Same seed → identical ledger + metrics.
-*   **285/285 tests pass** from a clean checkout on the remote box
+*   **303/303 tests pass** from a clean checkout on the remote box
     (CPython 3.12.3). 25 evaluate tests including adversarial leakage,
     golden economic, and reconciliation checks.
 

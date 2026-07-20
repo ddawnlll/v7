@@ -1,4 +1,4 @@
-"""Tests for tools/snapshot.py — build validation, pagination guards, and
+"""Tests for tools/data.py — build validation, pagination guards, and
 load round-trip integrity.
 
 Deliberately does NOT test the network fetch functions themselves — that

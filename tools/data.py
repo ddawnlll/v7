@@ -41,8 +41,8 @@ OBSERVE (CLI subcommand)
     ``baseline`` — every 5m bar, plumbing/sanity baseline (observations.json)
     ``stage_b``  — 15m/1h/4h decision intervals (observations_stage_b.json)
 
-CLI:  python3 tools/snapshot.py build [--inst-id BTC-USDT-SWAP] [--days 90]
-      python3 tools/snapshot.py observe --snapshot-dir data/snapshots/okx-btc-usdt-swap-5m-...
+      python tools/data.py build [--inst-id BTC-USDT-SWAP] [--days 90]
+      python tools/data.py observe --snapshot-dir data/snapshots/okx-btc-usdt-swap-5m-...
 """
 
 from __future__ import annotations

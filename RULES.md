@@ -58,9 +58,9 @@ and seen it pass. Claude's summary is not evidence; the command output is.
 
 ## 12. No process theater
 No ACCP reports, no lock ledgers, no phase ceremonies. Docs are: README, RULES, ROADMAP,
-ARCHITECTURE, and code comments that state constraints. Everything else is a test.
+SYSTEM.md, and code comments that state constraints. Everything else is a test.
 
-ARCHITECTURE was added because the authority-boundary map (which file owns which
+SYSTEM.md was added because the authority-boundary map (which file owns which
 economic/causal decision, RULES §4) grew too large to keep solely in ROADMAP's
 phase-gated language without either bloating ROADMAP or losing the map entirely.
 It describes structure and boundaries, never phase status — status stays in
@@ -122,7 +122,7 @@ shadow implementation that passes green while computing something other than wha
 claims to — mutation testing is what actually proves the suite exercises every line, not
 just that green tests exist.
 
-This does not retroactively reopen the tag recorded at commit `8117950`; it applies from
+This does not retroactively reopen the tag recorded at `simulation-authority` (`d1fc0dd`); it applies from
 the next commit that touches `lab/sim.py` onward.
 
 `lab/indicators.py` has no mutation config yet — this gate does not apply to it until a

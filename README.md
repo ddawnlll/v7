@@ -33,6 +33,6 @@ Phase 0–5 locked. Now in **Phase 6** (first falsifiable hypothesis).
 - Phase 4: `outcome-contract-authority` tag — HunterSpec V0, 7/7 geometry gates
 - Phase 5: `evaluation-authority` tag — PredictionContext safety, TAKE/ABSTAIN, immutable ledger
 
-**287/287 tests pass** from clean checkout on remote box (CPython 3.12.3).
+**303/303 tests pass** from clean checkout on remote box (CPython 3.12.3).
 
 See [ROADMAP.md](ROADMAP.md) for evidence. Rules: [RULES.md](RULES.md).
