@@ -214,7 +214,7 @@ def test_verify_splits_passes_on_valid_events():
     events = [
         _event(4500000, "LONG", 1.0, split="train"),
         _event(4800000, "LONG", 2.0, split="train"),
-        _event(1_000_000, "LONG", 3.0, split="test"),
+        _event(5500000, "LONG", 3.0, split="test"),
     ]
     assert verify_splits(events, frozen_test_start_ts=5400000)
 
