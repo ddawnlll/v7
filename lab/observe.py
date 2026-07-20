@@ -67,33 +67,10 @@ class Setup:
     decision_interval_label: str = "5m"
 
 
-DEFAULT_SETUPS: tuple[Setup, ...] = (
-    Setup("tight", k_stop=1.0, reward_risk=1.5, max_holding_bars=12),    # ~1h
-    Setup("medium", k_stop=1.5, reward_risk=2.0, max_holding_bars=48),   # ~4h
-    Setup("wide", k_stop=2.0, reward_risk=3.0, max_holding_bars=288),    # ~1d
-)
-
-# Stage B — ARCHITECTURE §8.1's actual candidate geometry (15m/1h/4h decision
-# intervals, 1h primary), same three economic horizons as DEFAULT_SETUPS.
-# Exploratory: not a locked HunterSpec (see tools/snapshot.py observe subcommand).
-_HORIZONS: tuple[tuple[str, float, float, int], ...] = (
-    ("tight", 1.0, 1.5, 12),
-    ("medium", 1.5, 2.0, 48),
-    ("wide", 2.0, 3.0, 288),
-)
-_STAGE_B_INTERVALS: tuple[tuple[str, int], ...] = (
-    ("15m", 3),
-    ("1h", 12),
-    ("4h", 48),
-)
-STAGE_B_SETUPS: tuple[Setup, ...] = tuple(
-    Setup(
-        f"{h_label}_{i_label}", k_stop=k, reward_risk=rr, max_holding_bars=mh,
-        decision_interval_factor=factor, decision_interval_label=i_label,
-    )
-    for h_label, k, rr, mh in _HORIZONS
-    for i_label, factor in _STAGE_B_INTERVALS
-)
+# Phase 4 decoupling: observe() is a pure consumer — setups are passed in by the
+# caller (tools/snapshot.py for Phase 3 plumbing, lab/validate_phase4.py for
+# Phase 4 HunterSpec gate checks). No default setup constants live here.
+# See specs/hunter_candidate_v0.json for the locked HunterSpec geometry.
 
 _SIDES: tuple[sim.Side, ...] = ("LONG", "SHORT")
 
@@ -177,7 +154,8 @@ def _candidate_decisions(
 def observe(
     trade_bars: Sequence[Bar],
     funding_events: Sequence[sim.FundingEvent] = (),
-    setups: Sequence[Setup] = DEFAULT_SETUPS,
+    *,
+    setups: Sequence[Setup],
 ) -> dict:
     """Measure observable outcome properties on ``trade_bars`` for each
     setup in ``setups``. Returns one JSON-able dict keyed by setup label."""

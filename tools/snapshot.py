@@ -654,15 +654,43 @@ def load(snapshot_dir: Path) -> LoadedSnapshot:
 # CLI — dispatch between build and observe subcommands
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Phase 3 plumbing setups — hardcoded here because this is the CLI tool,
+# not a pure consumer. observe() itself takes setups as a parameter with
+# no defaults (Phase 4 decoupling: ROADMAP Phase 4).
+_BASELINE_SETUPS: tuple[observe_module.Setup, ...] = (
+    observe_module.Setup("tight", k_stop=1.0, reward_risk=1.5, max_holding_bars=12),
+    observe_module.Setup("medium", k_stop=1.5, reward_risk=2.0, max_holding_bars=48),
+    observe_module.Setup("wide", k_stop=2.0, reward_risk=3.0, max_holding_bars=288),
+)
+
+_STAGE_B_HORIZONS: tuple[tuple[str, float, float, int], ...] = (
+    ("tight", 1.0, 1.5, 12),
+    ("medium", 1.5, 2.0, 48),
+    ("wide", 2.0, 3.0, 288),
+)
+_STAGE_B_INTERVALS: tuple[tuple[str, int], ...] = (
+    ("15m", 3),
+    ("1h", 12),
+    ("4h", 48),
+)
+_STAGE_B_SETUPS: tuple[observe_module.Setup, ...] = tuple(
+    observe_module.Setup(
+        f"{h_label}_{i_label}", k_stop=k, reward_risk=rr, max_holding_bars=mh,
+        decision_interval_factor=factor, decision_interval_label=i_label,
+    )
+    for h_label, k, rr, mh in _STAGE_B_HORIZONS
+    for i_label, factor in _STAGE_B_INTERVALS
+)
+
 _OBSERVE_MODES = {
     "baseline": {
-        "setups": observe_module.DEFAULT_SETUPS,
+        "setups": _BASELINE_SETUPS,
         "out_filename": "observations.json",
         "decision_interval": "5m",
         "observation_purpose": "plumbing_sanity_baseline",
     },
     "stage_b": {
-        "setups": observe_module.STAGE_B_SETUPS,
+        "setups": _STAGE_B_SETUPS,
         "out_filename": "observations_stage_b.json",
         "decision_interval": "15m/1h/4h",
         "observation_purpose": "stage_b_interval_geometry",

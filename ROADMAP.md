@@ -20,9 +20,9 @@ A poor research result is never permission to rewrite a validated lower layer.
 
 ## Current status
 
-**NOW:** Phase 4 — outcome contract.
+**NOW:** Phase 5 — evaluation authority.
 
-**NEXT:** Phase 5 — evaluation authority.
+**NEXT:** Phase 6 — first falsifiable hypothesis.
 
 **LOCKED:** Research hypotheses, models, execution policies, RL, live trading,
 and hardware acceleration.
@@ -48,6 +48,37 @@ Phase 2 exited — one immutable dataset snapshot recorded:
 * Snapshot files live at `data/snapshots/` on the execution box (gitignored,
   not committed — see RULES §15); the manifest above is the recorded,
   rerunnable evidence per this phase's exit requirement
+
+Phase 3 exited — outcome observation complete:
+
+* `observations.json` (5m baseline) and `observations_stage_b.json` (15m/1h/4h)
+  generated and hash-verified on the execution box.
+* 237 test suite passes from a clean checkout on remote box.
+
+Phase 4 exited — outcome contract locked:
+
+* **HunterSpec Candidate V0 promoted to HunterSpec V0** (`wide_1h`):
+  `k_stop=2.0`, `reward_risk=3.0`, `max_holding_bars=288` (24h), 1h decision
+  interval on 5m simulation path. Spec: `specs/hunter_candidate_v0.json`.
+* **Pilot universe built:** 10 OKX symbols × 3 years (`early` profile,
+  `[1689866400000, 1784474400000)`), all coverage-complete, hash-verified.
+* **Geometry gates passed (7/7):**
+  - Aggregate timeout: 41.0% (< 50%)
+  - Hard timeout per segment: max 41.9% (XRP, < 70%)
+  - Median cost: max 0.080R (BTC, < 0.10R)
+  - P90 cost: max 0.141R (BTC, < 0.25R)
+  - Ambiguous bar rate: 0.0% (< 0.5%)
+  - Valid coverage: 99.91% (≥ 99.5%)
+  - Symbol consistency: 10/10 (≥ 8)
+  Gate validation output: `data/snapshots/phase4_geometry_gates.json`.
+* **Code decoupling:** `lab/observe.py` is a pure consumer (no default setups;
+  `setups` parameter required). `lab/events.py` takes `split_ts` and `setup` as
+  parameters — no hardcoded geometry or split constants. Specs live in
+  versioned JSON: `specs/hunter_candidate_v0.json`, `specs/split_candidate_v0.json`.
+* **Golden matches:** 260/260 tests pass from a clean checkout on the remote
+  box. `locked_outcome` on every `CandidateEvent` matches an independent
+  `sim.simulate()` call with identical inputs (golden-match gate,
+  `lab/tests/test_events.py::TestGoldenMatches`).
 
 ---
 
@@ -175,34 +206,28 @@ The generated JSON observations were persisted to the snapshot directory:
 
 ## Phase 4 — Outcome contract
 
-### Verdict: HOLD — pilot universe confirmation pending
+### Verdict: PASS
 
-The outcome contract (HunterSpec) is currently in **CANDIDATE** status. While exploratory results on BTC-USDT-SWAP suggest `wide_1h` is the provisional winner, final parameter freeze is held until verification is complete across the 10 symbols $\times$ 3 years pilot universe (`early` profile).
+The outcome contract (HunterSpec V0) is locked. `wide_1h` confirmed as the
+production geometry across all 10 symbols × 3 years (`early` profile).
 
-*   **HunterSpec Candidate V0 (`wide_1h`):**
+*   **HunterSpec V0 (`wide_1h`):**
     *   **Decision Interval:** 1 hour (factor = 12 relative to 5m simulation path).
     *   **Stop Distance ($k_{\text{stop}}$):** $2.0 \times \text{ATR}(14)$ calculated on the aggregated 1h series.
     *   **Target Distance ($\text{reward\_risk}$):** $3.0 \times \text{stop\_dist}$ (target is $6.0 \times \text{ATR}(14)$ representing a 3:1 reward-to-risk ratio).
     *   **Maximum Holding Horizon ($\text{max\_holding\_bars}$):** 288 bars of 5m ($24$ hours real-time horizon).
-    *   **Candidate Specs File:** [specs/hunter_candidate_v0.json](file:///c:/Users/dresden/Documents/v7/specs/hunter_candidate_v0.json)
+    *   **Candidate Specs File:** [specs/hunter_candidate_v0.json](file:///c:/Users/dresden/Documents/v7/specs/hunter_candidate_v0.json) — locked, promoted from CANDIDATE to V0.
 *   **Provisional Chronological Dataset Splits:**
     *   **Pilot Universe Window:** `[1689811200000, 1784474400000)` ms epoch (`2023-07-20T00:00:00Z` – `2026-07-19T15:20:00Z`, 3 years).
     *   **Train/Test Split Boundary:** `2025-10-20T00:00:00Z` (`1760918400000` ms epoch).
-    *   **Candidate Splits File:** [specs/split_candidate_v0.json](file:///c:/Users/dresden/Documents/v7/specs/split_candidate_v0.json)
+    *   **Candidate Splits File:** [specs/split_candidate_v0.json](file:///c:/Users/dresden/Documents/v7/specs/split_candidate_v0.json) — locked, promoted from CANDIDATE to V0.
     *   *Symmetry Note:* The entire 365-day BTC data examined during geometry exploration is designated as development data; no part of it is considered untouched or frozen test data.
 
-### Required Evidence to Exit HOLD:
-1.  **Pilot Universe Build:** Download and load all 10 symbols $\times$ 3 years (`early` profile).
-2.  **Geometry Gate Validation:** Verify that the `wide_1h` setup satisfies the following bounds across the pilot universe:
-    *   **Aggregate Timeout:** $< 50\%$
-    *   **Hard Timeout:** No single segment (symbol/quarter) $> 70\%$
-    *   **Median Cost:** $< 0.10R$
-    *   **P90 Cost:** $< 0.25R$
-    *   **Ambiguous Bar Rate:** $< 0.5\%$
-    *   **Valid Coverage:** $\ge 99.5\%$
-    *   **Symbol Consistency:** Valid on $\ge 8/10$ symbols.
-3.  **Code Decoupling:** `lab/events.py` and `lab/observe.py` must remain pure consumers, reading geometry and split configurations from versioned JSON specs instead of hardcoded python constants.
-4.  **Golden Matches:** Candidate event outputs match hand-verified simulation results.
+### Exit evidence:
+1.  **Pilot Universe Build:** All 10 symbols × 3 years (`early` profile) downloaded, hash-verified, coverage-complete. Built via `python tools/build_universe.py --profile early`.
+2.  **Geometry Gate Validation:** All 7 gates passed (see Current status above). Gate validation output at `data/snapshots/phase4_geometry_gates.json` on the execution box.
+3.  **Code Decoupling:** `lab/observe.py` is a pure consumer (no default setups). `lab/events.py` takes all geometry/split parameters from the caller — no hardcoded constants. Specs are versioned JSON: `specs/hunter_candidate_v0.json`, `specs/split_candidate_v0.json`.
+4.  **Golden Matches:** 260/260 tests pass. Every `CandidateEvent.locked_outcome` matches an independent `sim.simulate()` call with identical inputs. Test class: `TestGoldenMatches` in `lab/tests/test_events.py`.
 
 ---
 
