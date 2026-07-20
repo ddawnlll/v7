@@ -4,36 +4,36 @@ Minimal, fail-closed alpha research lab. Successor to `v7-engine` (frozen, read-
 
 **Goal:** build a lab that can say *"edge"* or *"no edge"* — and be trusted either way.
 
-## Mottos
-
-1. **Code is liability.** Core budget ~5k lines, hard cap 10k. Auditability is a constraint, not a feature.
-2. **Fail closed.** Missing or invalid input raises. No fallbacks. No synthetic data, ever, unless explicitly requested and loudly labeled.
-3. **Evidence is a command the operator ran** — never prose, never a report.
-4. **Every trade must be hand-verifiable** against raw candles. If you can't verify one trade by hand, the result is not observable and not trusted.
-5. **Prediction and decision never mix.** Models forecast; a separate, tiny, versioned policy decides.
-
 ## Layout
-
-One subsystem, one file (RULES §3, §13):
 
 ```
 lab/
-  sim.py          Deterministic truth core — defines net_R, labels, outcomes.
-                  Reference engine (scalar, hand-verifiable). Nothing else computes money.
-  indicators.py   Pure, causal research primitives. Never imported by sim.py.
-  data.py         Market truth — bar contract, gap detection, OHLC validation, hashing.
-  observe.py      Phase 3 outcome-geometry measurement. Reads sim.py; decides nothing.
-  tests/          Verification. Every claim is a test.
+  market.py       Bar/tape reality — validation, aggregation, hashing
+  indicators.py   Pure, causal research primitives (ATR, etc.)
+  sim.py          Deterministic truth core — net_R, labels, outcomes
+  events.py       Candidate-event authority — observe() + build_events()
+  evaluate.py     Evaluation authority — baselines, negative controls, ledger
 tools/
-  snapshot.py     Only file touching network/disk/wall-clock: build, load, observe.
-  tests/          Verification for tools/.
-cosmic-ray.toml   Mutation gate for lab/sim.py (RULES §17) — verify command in the
-                  file header. Every touch to sim.py needs a clean run before the
-                  simulation-authority tag moves.
-salvage/          Quarantine for code copied from v7-engine, UNAUDITED — see
-                  RULES.md §2. Not present on disk; nothing has entered quarantine yet.
+  snapshot.py     OKX data acquisition — build, load, verify, observe CLI
+  download_binance.py  Binance data acquisition + compilation
+  build_universe.py    Multi-symbol parallel build
+  export_llm.py        LLM context snapshot builder
+specs/
+  hunter_candidate_v0.json   Locked HunterSpec V0 geometry (wide_1h)
+  split_candidate_v0.json    Chronological train/test split boundary
 ```
 
 ## Status
 
-Phase 0 (indicator authority) and Phase 1 (simulation authority) locked: 227/227 tests pass from a clean checkout on the remote box, `indicator-authority`/`simulation-authority` tags recorded at commit `8117950`. Phase 2 (verified data snapshot) exited: one immutable BTC-USDT-SWAP 5m snapshot built and hash-verified. Phase 3 (outcome observation) exited: observations generated and hash-verified. Phase 4 (outcome contract) exited: HunterSpec V0 (`wide_1h`) locked, 7/7 geometry gates passed across 10 symbols × 3 years, 260/260 tests pass. Now in Phase 5 (evaluation authority). See [ROADMAP.md](ROADMAP.md) for the evidence. Rules of the house: [RULES.md](RULES.md).
+Phase 0–5 locked. Now in **Phase 6** (first falsifiable hypothesis).
+
+- Phase 0: `indicator-authority` tag
+- Phase 1: `simulation-authority` tag
+- Phase 2: verified data snapshot (BTC-USDT-SWAP, 90-day)
+- Phase 3: outcome observation (237 tests)
+- Phase 4: `outcome-contract-authority` tag — HunterSpec V0, 7/7 geometry gates
+- Phase 5: `evaluation-authority` tag — PredictionContext safety, TAKE/ABSTAIN, immutable ledger
+
+**285/285 tests pass** from clean checkout on remote box (CPython 3.12.3).
+
+See [ROADMAP.md](ROADMAP.md) for evidence. Rules: [RULES.md](RULES.md).
