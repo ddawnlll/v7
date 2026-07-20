@@ -1,4 +1,4 @@
-"""Hand-verifiable tests for lab/events.py observe() — Phase 3 outcome observation."""
+"""Hand-verifiable tests for lab/events.py observe() — Phase 3 outcome observation.
 
 Bars 0..15 are a flat "warmup" region (open=close=100, high=101, low=99):
 true range is 2.0 on every bar, so Wilder's ATR(14) is exactly 2.0 at every
