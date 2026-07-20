@@ -20,7 +20,7 @@ def test_export_order_covers_all_production_modules():
                 continue
             rel = f"{subdir}/{p.name}"
             # Skip the export script itself and known non-production files
-            if p.name in ("export_llm.py", "validate_phase4.py", "fetch_funding_tail.py"):
+            if p.name in ("export_llm.py", "validate_phase4.py"):
                 continue
             assert rel in exported, f"{rel} missing from export_llm.ORDER"
 
