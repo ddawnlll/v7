@@ -11,7 +11,7 @@ import math
 
 import pytest
 
-from lab import market
+from lab import market as tape
 
 I = 300_000  # 5m in ms
 
