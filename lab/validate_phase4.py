@@ -11,8 +11,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from lab import observe, sim  # noqa: E402
-from lab.observe import Setup  # noqa: E402
+from lab import events, sim  # noqa: E402
+from lab.events import Setup  # noqa: E402
 from tools.snapshot import load  # noqa: E402
 
 
@@ -84,7 +84,7 @@ def main() -> None:
             continue
 
         loaded = load(snap_dir)
-        report = observe.observe(
+        report = events.observe(
             loaded.trade_bars, loaded.funding_events, setups=(hunter,)
         )
         r = report["wide_1h"]

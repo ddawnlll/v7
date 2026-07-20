@@ -15,7 +15,7 @@ specific, predictable exit.
 import pytest
 
 from lab.tape import Bar
-from lab.observe import ATR_PERIOD, Setup, observe
+from lab.events import ATR_PERIOD, Setup, observe
 
 _SETUP = Setup("test", k_stop=1.0, reward_risk=2.0, max_holding_bars=3)
 _N = ATR_PERIOD + _SETUP.max_holding_bars + 2  # = 19, decision bar i=14 only

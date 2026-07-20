@@ -69,7 +69,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from lab import observe as observe_module, sim, tape  # noqa: E402
+from lab import events as events_module, sim, tape  # noqa: E402
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # constants
@@ -657,10 +657,10 @@ def load(snapshot_dir: Path) -> LoadedSnapshot:
 # Phase 3 plumbing setups — hardcoded here because this is the CLI tool,
 # not a pure consumer. observe() itself takes setups as a parameter with
 # no defaults (Phase 4 decoupling: ROADMAP Phase 4).
-_BASELINE_SETUPS: tuple[observe_module.Setup, ...] = (
-    observe_module.Setup("tight", k_stop=1.0, reward_risk=1.5, max_holding_bars=12),
-    observe_module.Setup("medium", k_stop=1.5, reward_risk=2.0, max_holding_bars=48),
-    observe_module.Setup("wide", k_stop=2.0, reward_risk=3.0, max_holding_bars=288),
+_BASELINE_SETUPS: tuple[events_module.Setup, ...] = (
+    events_module.Setup("tight", k_stop=1.0, reward_risk=1.5, max_holding_bars=12),
+    events_module.Setup("medium", k_stop=1.5, reward_risk=2.0, max_holding_bars=48),
+    events_module.Setup("wide", k_stop=2.0, reward_risk=3.0, max_holding_bars=288),
 )
 
 _STAGE_B_HORIZONS: tuple[tuple[str, float, float, int], ...] = (
@@ -673,8 +673,8 @@ _STAGE_B_INTERVALS: tuple[tuple[str, int], ...] = (
     ("1h", 12),
     ("4h", 48),
 )
-_STAGE_B_SETUPS: tuple[observe_module.Setup, ...] = tuple(
-    observe_module.Setup(
+_STAGE_B_SETUPS: tuple[events_module.Setup, ...] = tuple(
+    events_module.Setup(
         f"{h_label}_{i_label}", k_stop=k, reward_risk=rr, max_holding_bars=mh,
         decision_interval_factor=factor, decision_interval_label=i_label,
     )
@@ -710,7 +710,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
 def _cmd_observe(args: argparse.Namespace) -> None:
     mode = _OBSERVE_MODES[args.setups]
     loaded = load(args.snapshot_dir)
-    report = observe_module.observe(
+    report = events_module.observe(
         loaded.trade_bars, loaded.funding_events, setups=mode["setups"]
     )
 
