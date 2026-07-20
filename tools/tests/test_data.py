@@ -121,7 +121,8 @@ def _write_snapshot(tmp_path, *, trade_complete=True, mark_complete=True, tamper
     (tmp_path / "instrument.json").write_text(json.dumps({"instId": "TEST-SWAP"}))
 
     manifest = {
-        "inst_id": "TEST-SWAP",
+        "instrument_id": "TEST-SWAP",
+        "source": "okx",
         "bar": "5m",
         "requested_start_ts": 0,
         "requested_end_ts": 900_000,
@@ -186,7 +187,8 @@ def test_bar_count_short_of_expected_rejected_even_if_flagged_complete(tmp_path)
     (tmp_path / "instrument.json").write_text(json.dumps({"instId": "TEST-SWAP"}))
 
     manifest = {
-        "inst_id": "TEST-SWAP",
+        "instrument_id": "TEST-SWAP",
+        "source": "okx",
         "bar": "5m",
         "requested_start_ts": 0,
         "requested_end_ts": 900_000,
@@ -221,7 +223,8 @@ def test_trade_mark_misalignment_rejected(tmp_path):
     (tmp_path / "instrument.json").write_text(json.dumps({"instId": "TEST-SWAP"}))
 
     manifest = {
-        "inst_id": "TEST-SWAP",
+        "instrument_id": "TEST-SWAP",
+        "source": "okx",
         "bar": "5m",
         "requested_start_ts": 0,
         "requested_end_ts": 900_000,
