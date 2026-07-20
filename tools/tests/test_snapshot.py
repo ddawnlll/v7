@@ -11,7 +11,7 @@ from unittest import mock
 
 import pytest
 
-from lab import tape
+from lab import market
 from tools import snapshot as sn
 
 
@@ -102,16 +102,16 @@ def test_pagination_normal_termination_still_works():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _TRADE_BARS = [
-    tape.Bar(open_ts=0, open=100.0, high=101.0, low=99.0, close=100.0, volume=1.0),
-    tape.Bar(open_ts=300_000, open=100.0, high=102.0, low=98.0, close=101.0, volume=2.0),
-    tape.Bar(open_ts=600_000, open=101.0, high=103.0, low=100.0, close=102.0, volume=1.5),
+    market.Bar(open_ts=0, open=100.0, high=101.0, low=99.0, close=100.0, volume=1.0),
+    market.Bar(open_ts=300_000, open=100.0, high=102.0, low=98.0, close=101.0, volume=2.0),
+    market.Bar(open_ts=600_000, open=101.0, high=103.0, low=100.0, close=102.0, volume=1.5),
 ]
 _MARK_BARS = [
-    tape.MarkBar(open_ts=0, open=100.0, high=101.0, low=99.0, close=100.0),
-    tape.MarkBar(open_ts=300_000, open=100.0, high=102.0, low=98.0, close=101.5),
-    tape.MarkBar(open_ts=600_000, open=101.0, high=103.0, low=100.0, close=102.5),
+    market.MarkBar(open_ts=0, open=100.0, high=101.0, low=99.0, close=100.0),
+    market.MarkBar(open_ts=300_000, open=100.0, high=102.0, low=98.0, close=101.5),
+    market.MarkBar(open_ts=600_000, open=101.0, high=103.0, low=100.0, close=102.5),
 ]
-_FUNDING_RECORDS = [tape.FundingRecord(funding_time=300_000, rate=0.0001)]
+_FUNDING_RECORDS = [market.FundingRecord(funding_time=300_000, rate=0.0001)]
 
 
 def _write_snapshot(tmp_path, *, trade_complete=True, mark_complete=True, tamper_trade=False):
@@ -127,19 +127,19 @@ def _write_snapshot(tmp_path, *, trade_complete=True, mark_complete=True, tamper
         "requested_end_ts": 900_000,
         "trade": {
             "coverage_complete": trade_complete,
-            "dataset_hash": tape.trade_tape_hash(_TRADE_BARS),
+            "dataset_hash": market.trade_tape_hash(_TRADE_BARS),
         },
         "mark": {
             "coverage_complete": mark_complete,
-            "dataset_hash": tape.mark_tape_hash(_MARK_BARS),
+            "dataset_hash": market.mark_tape_hash(_MARK_BARS),
         },
-        "funding": {"dataset_hash": tape.funding_tape_hash(_FUNDING_RECORDS)},
+        "funding": {"dataset_hash": market.funding_tape_hash(_FUNDING_RECORDS)},
     }
     (tmp_path / "manifest.json").write_text(json.dumps(manifest))
 
     if tamper_trade:
         tampered = [
-            tape.Bar(open_ts=b.open_ts, open=b.open, high=b.high, low=b.low,
+            market.Bar(open_ts=b.open_ts, open=b.open, high=b.high, low=b.low,
                      close=b.close + 999.0, volume=b.volume)
             for b in _TRADE_BARS
         ]
@@ -192,13 +192,13 @@ def test_bar_count_short_of_expected_rejected_even_if_flagged_complete(tmp_path)
         "requested_end_ts": 900_000,
         "trade": {
             "coverage_complete": True,
-            "dataset_hash": tape.trade_tape_hash(short_trade),
+            "dataset_hash": market.trade_tape_hash(short_trade),
         },
         "mark": {
             "coverage_complete": True,
-            "dataset_hash": tape.mark_tape_hash(_MARK_BARS),
+            "dataset_hash": market.mark_tape_hash(_MARK_BARS),
         },
-        "funding": {"dataset_hash": tape.funding_tape_hash(_FUNDING_RECORDS)},
+        "funding": {"dataset_hash": market.funding_tape_hash(_FUNDING_RECORDS)},
     }
     (tmp_path / "manifest.json").write_text(json.dumps(manifest))
 
@@ -211,7 +211,7 @@ def test_trade_mark_misalignment_rejected(tmp_path):
     events are mapped onto both by index, so a silently misaligned mark
     tape would attach the wrong settlement price to a funding event."""
     shifted_mark = [
-        tape.MarkBar(open_ts=b.open_ts + 300_000, open=b.open, high=b.high,
+        market.MarkBar(open_ts=b.open_ts + 300_000, open=b.open, high=b.high,
                      low=b.low, close=b.close)
         for b in _MARK_BARS
     ]
@@ -227,13 +227,13 @@ def test_trade_mark_misalignment_rejected(tmp_path):
         "requested_end_ts": 900_000,
         "trade": {
             "coverage_complete": True,
-            "dataset_hash": tape.trade_tape_hash(_TRADE_BARS),
+            "dataset_hash": market.trade_tape_hash(_TRADE_BARS),
         },
         "mark": {
             "coverage_complete": True,
-            "dataset_hash": tape.mark_tape_hash(shifted_mark),
+            "dataset_hash": market.mark_tape_hash(shifted_mark),
         },
-        "funding": {"dataset_hash": tape.funding_tape_hash(_FUNDING_RECORDS)},
+        "funding": {"dataset_hash": market.funding_tape_hash(_FUNDING_RECORDS)},
     }
     (tmp_path / "manifest.json").write_text(json.dumps(manifest))
 

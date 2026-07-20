@@ -69,7 +69,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from lab import events as events_module, sim, tape  # noqa: E402
+from lab import events as events_module, sim, market as tape  # noqa: E402
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # constants
@@ -367,14 +367,14 @@ def build(
             funding_rows = funding_future.result()
             instrument = instrument_future.result()
 
-        trade_bars = tape.to_bars(_to_trade_records(trade_rows, start_ts, end_ts), interval_ms)
-        mark_bars = tape.to_mark_bars(_to_mark_records(mark_rows, start_ts, end_ts), interval_ms)
-        funding_records = tape.to_funding_records(
+        trade_bars = market.to_bars(_to_trade_records(trade_rows, start_ts, end_ts), interval_ms)
+        mark_bars = market.to_mark_bars(_to_mark_records(mark_rows, start_ts, end_ts), interval_ms)
+        funding_records = market.to_funding_records(
             _to_funding_input_records(funding_rows, start_ts, end_ts)
         )
 
-        trade_gaps = tape.detect_gaps(trade_bars, interval_ms)
-        mark_gaps = tape.detect_gaps(mark_bars, interval_ms)
+        trade_gaps = market.detect_gaps(trade_bars, interval_ms)
+        mark_gaps = market.detect_gaps(mark_bars, interval_ms)
 
         expected_bars = (end_ts - start_ts) // interval_ms
         trade_complete = len(trade_bars) == expected_bars
@@ -416,7 +416,7 @@ def build(
                 "end_ts": trade_bars[-1].open_ts if trade_bars else None,
                 "gap_count": len(trade_gaps),
                 "gaps": [g.__dict__ for g in trade_gaps],
-                "dataset_hash": tape.trade_tape_hash(trade_bars),
+                "dataset_hash": market.trade_tape_hash(trade_bars),
             },
             "mark": {
                 "rows_fetched": len(mark_rows),
@@ -427,12 +427,12 @@ def build(
                 "end_ts": mark_bars[-1].open_ts if mark_bars else None,
                 "gap_count": len(mark_gaps),
                 "gaps": [g.__dict__ for g in mark_gaps],
-                "dataset_hash": tape.mark_tape_hash(mark_bars),
+                "dataset_hash": market.mark_tape_hash(mark_bars),
             },
             "funding": {
                 "records_fetched": len(funding_rows),
                 "records_valid": len(funding_records),
-                "dataset_hash": tape.funding_tape_hash(funding_records),
+                "dataset_hash": market.funding_tape_hash(funding_records),
             },
         }
         (staging_dir / "manifest.json").write_text(
@@ -456,20 +456,20 @@ class LoadedSnapshot:
     """A snapshot's contents, already hash-verified against its manifest and
     ready to hand to lab/observe.py (or any other pure consumer)."""
 
-    trade_bars: list[tape.Bar]
-    mark_bars: list[tape.MarkBar]
+    trade_bars: list[market.Bar]
+    mark_bars: list[market.MarkBar]
     funding_events: list[sim.FundingEvent]
     manifest: dict
-    index_bars: list[tape.MarkBar] | None = None
-    premium_bars: list[tape.MarkBar] | None = None
+    index_bars: list[market.MarkBar] | None = None
+    premium_bars: list[market.MarkBar] | None = None
 
 
-def _read_trade_bars(path: Path) -> list[tape.Bar]:
+def _read_trade_bars(path: Path) -> list[market.Bar]:
     table = pq.read_table(path)
     cols = table.to_pydict()
     if "quote_volume" in cols:
         return [
-            tape.Bar(
+            market.Bar(
                 open_ts=o, open=op, high=h, low=lo, close=c, volume=v,
                 quote_volume=qv, trade_count=tc,
                 taker_buy_base_volume=tbb, taker_buy_quote_volume=tbq
@@ -482,7 +482,7 @@ def _read_trade_bars(path: Path) -> list[tape.Bar]:
             )
         ]
     return [
-        tape.Bar(open_ts=o, open=op, high=h, low=lo, close=c, volume=v)
+        market.Bar(open_ts=o, open=op, high=h, low=lo, close=c, volume=v)
         for o, op, h, lo, c, v in zip(
             cols["open_ts"], cols["open"], cols["high"], cols["low"],
             cols["close"], cols["volume"],
@@ -490,30 +490,30 @@ def _read_trade_bars(path: Path) -> list[tape.Bar]:
     ]
 
 
-def _read_mark_bars(path: Path) -> list[tape.MarkBar]:
+def _read_mark_bars(path: Path) -> list[market.MarkBar]:
     table = pq.read_table(path)
     cols = table.to_pydict()
     return [
-        tape.MarkBar(open_ts=o, open=op, high=h, low=lo, close=c)
+        market.MarkBar(open_ts=o, open=op, high=h, low=lo, close=c)
         for o, op, h, lo, c in zip(
             cols["open_ts"], cols["open"], cols["high"], cols["low"], cols["close"],
         )
     ]
 
 
-def _read_funding_records(path: Path) -> list[tape.FundingRecord]:
+def _read_funding_records(path: Path) -> list[market.FundingRecord]:
     table = pq.read_table(path)
     cols = table.to_pydict()
     return [
-        tape.FundingRecord(funding_time=t, rate=r)
+        market.FundingRecord(funding_time=t, rate=r)
         for t, r in zip(cols["funding_time"], cols["rate"])
     ]
 
 
 def _funding_events(
-    funding_records: Sequence[tape.FundingRecord],
-    trade_bars: Sequence[tape.Bar],
-    mark_bars: Sequence[tape.MarkBar],
+    funding_records: Sequence[market.FundingRecord],
+    trade_bars: Sequence[market.Bar],
+    mark_bars: Sequence[market.MarkBar],
 ) -> list[sim.FundingEvent]:
     """Map each raw funding record onto a trade-bar index and a settlement
     mark price (ARCHITECTURE §8.2: mark bars are used only where the
@@ -598,9 +598,9 @@ def load(snapshot_dir: Path) -> LoadedSnapshot:
         )
 
     checks = [
-        ("trade", tape.trade_tape_hash(trade_bars), manifest["trade"]["dataset_hash"]),
-        ("mark", tape.mark_tape_hash(mark_bars), manifest["mark"]["dataset_hash"]),
-        ("funding", tape.funding_tape_hash(funding_records),
+        ("trade", market.trade_tape_hash(trade_bars), manifest["trade"]["dataset_hash"]),
+        ("mark", market.mark_tape_hash(mark_bars), manifest["mark"]["dataset_hash"]),
+        ("funding", market.funding_tape_hash(funding_records),
          manifest["funding"]["dataset_hash"]),
     ]
 
@@ -615,7 +615,7 @@ def load(snapshot_dir: Path) -> LoadedSnapshot:
             raise ValueError(
                 f"{snapshot_dir}: trade and index tapes are not index-aligned"
             )
-        checks.append(("index", tape.mark_tape_hash(index_bars), manifest["index"]["dataset_hash"]))
+        checks.append(("index", market.mark_tape_hash(index_bars), manifest["index"]["dataset_hash"]))
 
     premium_bars = None
     if "premium" in manifest:
@@ -628,7 +628,7 @@ def load(snapshot_dir: Path) -> LoadedSnapshot:
             raise ValueError(
                 f"{snapshot_dir}: trade and premium tapes are not index-aligned"
             )
-        checks.append(("premium", tape.mark_tape_hash(premium_bars), manifest["premium"]["dataset_hash"]))
+        checks.append(("premium", market.mark_tape_hash(premium_bars), manifest["premium"]["dataset_hash"]))
 
     for tape_name, recomputed, recorded in checks:
         if recomputed != recorded:

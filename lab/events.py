@@ -21,8 +21,8 @@ from typing import Sequence
 
 import numpy as np
 
-from lab import indicators, sim, tape
-from lab.tape import Bar
+from lab import indicators, sim, market as tape
+from lab.market import Bar
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # constants

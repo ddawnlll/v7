@@ -14,7 +14,7 @@ specific, predictable exit.
 """
 import pytest
 
-from lab.tape import Bar
+from lab.market import Bar
 from lab.events import ATR_PERIOD, Setup, observe
 
 _SETUP = Setup("test", k_stop=1.0, reward_risk=2.0, max_holding_bars=3)

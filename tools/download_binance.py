@@ -33,7 +33,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from lab import tape  # noqa: E402
+from lab import market  # noqa: E402
 
 # Standard universes mapped to Binance symbols
 # full profile: top 56 USD-M perpetuals by 24h quote volume (snapshot 2026-07-20)
@@ -305,66 +305,15 @@ def validate_premium_bars(records: list[tuple], interval_ms: int) -> list[tape.M
     return bars
 
 
-def align_and_fill_trade_bars(records: list[tuple], master_grid: list[int]) -> list[tuple]:
-    """Align trade records to master grid, forward-filling prices and setting volume/counts to 0."""
-    rec_dict = {r[0]: r for r in records}
-    aligned = []
-    last_val = None
-    
-    # First, find the first available record to BFill if start is missing
-    if records:
-        first_val = records[0]
-    else:
-        first_val = (0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0, 0.0, 0.0)
-        
-    for ts in master_grid:
-        if ts in rec_dict:
-            r = rec_dict[ts]
-            aligned.append(r)
-            last_val = r
-        else:
-            fill_src = last_val if last_val is not None else first_val
-            aligned.append((
-                ts,
-                fill_src[4],  # open = prev close
-                fill_src[4],  # high = prev close
-                fill_src[4],  # low = prev close
-                fill_src[4],  # close = prev close
-                0.0,          # volume = 0
-                0.0,          # quote_volume = 0
-                0,            # trade_count = 0
-                0.0,          # taker_buy_base_volume = 0
-                0.0,          # taker_buy_quote_volume = 0
-            ))
-    return aligned
+def _detect_gaps(records: list[tuple], master_grid: list[int], tape_name: str) -> list[int]:
+    """Return sorted list of master_grid timestamps missing from records.
 
-
-def align_and_fill_price_bars(records: list[tuple], master_grid: list[int]) -> list[tuple]:
-    """Align price records to master grid, forward-filling all price fields."""
-    rec_dict = {r[0]: r for r in records}
-    aligned = []
-    last_val = None
-    
-    if records:
-        first_val = records[0]
-    else:
-        first_val = (0, 1.0, 1.0, 1.0, 1.0)
-        
-    for ts in master_grid:
-        if ts in rec_dict:
-            r = rec_dict[ts]
-            aligned.append(r)
-            last_val = r
-        else:
-            fill_src = last_val if last_val is not None else first_val
-            aligned.append((
-                ts,
-                fill_src[4],  # open = prev close
-                fill_src[4],  # high = prev close
-                fill_src[4],  # low = prev close
-                fill_src[4],  # close = prev close
-            ))
-    return aligned
+    Does NOT synthesize data. Missing bars are gaps, not zero-volume candles.
+    RULES §1: no synthetic data. Caller decides whether to reject or record.
+    """
+    present = {r[0] for r in records}
+    gaps = [ts for ts in master_grid if ts not in present]
+    return gaps
 
 
 def compile_tapes(sym: str, start_ts: int, end_ts: int, months: list, days: list, cache_dir: Path, out_dir: Path) -> None:
@@ -416,13 +365,14 @@ def compile_tapes(sym: str, start_ts: int, end_ts: int, months: list, days: list
     expected_bars = (end_ts - start_ts) // 300_000
     master_grid = [start_ts + i * 300_000 for i in range(expected_bars)]
 
-    # Align and gap-fill all price/trade tapes to the master grid
-    trade_recs = align_and_fill_trade_bars(trade_recs, master_grid)
-    mark_recs = align_and_fill_price_bars(mark_recs, master_grid)
-    index_recs = align_and_fill_price_bars(index_recs, master_grid)
-    premium_recs = align_and_fill_price_bars(premium_recs, master_grid)
+    # Detect gaps — refuse to synthesize. Missing bars are gaps, not zero-volume candles.
+    trade_gaps = _detect_gaps(trade_recs, master_grid, "trade")
+    mark_gaps = _detect_gaps(mark_recs, master_grid, "mark")
+    index_gaps = _detect_gaps(index_recs, master_grid, "index")
+    premium_gaps = _detect_gaps(premium_recs, master_grid, "premium")
+    all_gaps = {"trade": trade_gaps, "mark": mark_gaps, "index": index_gaps, "premium": premium_gaps}
 
-    # Core Validation via lab/tape
+    # Core Validation via lab/market (formerly lab/tape)
     trade_to_verify = [x[:6] for x in trade_recs]
     validated_trade_bars = tape.to_bars(trade_to_verify, 300_000)
     validated_mark_bars = tape.to_mark_bars(mark_recs, 300_000)
@@ -489,21 +439,29 @@ def compile_tapes(sym: str, start_ts: int, end_ts: int, months: list, days: list
             "dataset_hash": trade_hash,
             "n_records": len(trade_recs),
             "coverage_complete": len(trade_recs) == expected_bars,
+            "gap_count": len(trade_gaps),
+            "gaps": trade_gaps[:100],  # first 100, don't bloat manifest
         },
         "mark": {
             "dataset_hash": mark_hash,
             "n_records": len(mark_recs),
             "coverage_complete": len(mark_recs) == expected_bars,
+            "gap_count": len(mark_gaps),
+            "gaps": mark_gaps[:100],
         },
         "index": {
             "dataset_hash": index_hash,
             "n_records": len(index_recs),
             "coverage_complete": len(index_recs) == expected_bars,
+            "gap_count": len(index_gaps),
+            "gaps": index_gaps[:100],
         },
         "premium": {
             "dataset_hash": premium_hash,
             "n_records": len(premium_recs),
             "coverage_complete": len(premium_recs) == expected_bars,
+            "gap_count": len(premium_gaps),
+            "gaps": premium_gaps[:100],
         },
         "funding": {
             "dataset_hash": funding_hash,

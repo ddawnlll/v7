@@ -20,7 +20,7 @@ import numpy as np
 
 from lab.events import CandidateEvent
 from lab.indicators import compute_atr
-from lab.tape import Bar
+from lab.market import Bar
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # types

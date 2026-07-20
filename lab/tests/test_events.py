@@ -6,7 +6,7 @@ import pytest
 
 from lab import events as events_module, sim
 from lab.events import CandidateEvent, EventInput
-from lab.tape import Bar
+from lab.market import Bar
 from lab.events import Setup
 
 _SETUP = Setup("test", k_stop=1.0, reward_risk=2.0, max_holding_bars=3)

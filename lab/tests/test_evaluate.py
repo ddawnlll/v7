@@ -28,7 +28,7 @@ from lab.evaluate import (
 )
 from lab.events import CandidateEvent
 from lab.sim import TradeOutcome, CostBreakdown
-from lab.tape import Bar
+from lab.market import Bar
 
 
 # ——— helpers ———
