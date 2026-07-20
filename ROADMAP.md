@@ -37,7 +37,7 @@ Phase 2 exited — one immutable dataset snapshot recorded:
 * Source: OKX, `BTC-USDT-SWAP`, `5m` bar
 * Window: `[1776698400000, 1784474400000)` ms epoch
   (`2026-04-20T15:20:00Z` – `2026-07-19T15:20:00Z`, 90 days)
-* Build command: `python3 tools/build_snapshot.py --start-ts 1776698400000 --end-ts 1784474400000`
+* Build command: `python3 tools/snapshot.py build --start-ts 1776698400000 --end-ts 1784474400000`
 * `trade_dataset_hash`: `d08d100a35de8f8c65d6502d8e236aa7fb88626e4b2a398a20fe3a4a0a4c123a`
 * `mark_dataset_hash`: `bb4d118460ecbb8580344bc9b9883558d1e4d4fa983b03c9c3d77f7482d059a9`
 * `funding_dataset_hash`: `89dbf4481b57025a727b96cfdff412aed4fec0499f1c1eb8e3f12595bea3959c`

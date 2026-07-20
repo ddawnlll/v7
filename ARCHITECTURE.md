@@ -497,7 +497,7 @@ lab/
 └── eval.py
 
 tools/
-└── build_snapshot.py
+└── snapshot.py
 
 tests/
 ├── test_truth.py

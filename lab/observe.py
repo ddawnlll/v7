@@ -1,7 +1,7 @@
 """Phase 3 — outcome observation (ROADMAP Phase 3).
 
 Pure: no I/O, no network, no wall-clock. Given already-verified trade bars
-and funding events (tools/load_snapshot.py hands those over), measures what
+and funding events (tools/snapshot.py hands those over), measures what
 outcome structures actually exist in the data using the locked `lab.sim`
 simulation authority — MAE/MFE, time-to-outcome, target-before-stop base
 rates, cost sensitivity, same-bar ambiguity. Trains no model and presumes no
@@ -75,7 +75,7 @@ DEFAULT_SETUPS: tuple[Setup, ...] = (
 
 # Stage B — ARCHITECTURE §8.1's actual candidate geometry (15m/1h/4h decision
 # intervals, 1h primary), same three economic horizons as DEFAULT_SETUPS.
-# Exploratory: not a locked HunterSpec (see tools/run_observation.py).
+# Exploratory: not a locked HunterSpec (see tools/snapshot.py observe subcommand).
 _HORIZONS: tuple[tuple[str, float, float, int], ...] = (
     ("tight", 1.0, 1.5, 12),
     ("medium", 1.5, 2.0, 48),
@@ -142,7 +142,7 @@ def _candidate_decisions(
     decision closes exactly when its last constituent 5m bar closes, which
     is the same moment the next 5m bar opens (candles are contiguous) — so
     the entry is found by locating that 5m bar's ``open_ts`` via bisect,
-    same pattern ``tools/load_snapshot.py`` uses for funding-event mapping.
+    same pattern ``tools/snapshot.py`` uses for funding-event mapping.
     ``entry_index`` is ``None`` when a decision doesn't map onto the 5m
     tape's covered range or the horizon wouldn't fit.
     """
