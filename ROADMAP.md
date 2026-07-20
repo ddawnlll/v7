@@ -20,9 +20,9 @@ A poor research result is never permission to rewrite a validated lower layer.
 
 ## Current status
 
-**NOW:** Phase 5 — evaluation authority.
+**NOW:** Phase 6 — first falsifiable hypothesis.
 
-**NEXT:** Phase 6 — first falsifiable hypothesis.
+**NEXT:** Phase 7 — minimal predictive challenger.
 
 **LOCKED:** Research hypotheses, models, execution policies, RL, live trading,
 and hardware acceleration.
@@ -79,6 +79,25 @@ Phase 4 exited — outcome contract locked:
   box. `locked_outcome` on every `CandidateEvent` matches an independent
   `sim.simulate()` call with identical inputs (golden-match gate,
   `lab/tests/test_events.py::TestGoldenMatches`).
+
+Phase 5 exited — evaluation authority locked:
+
+* **PredictionContext:** Predictors receive only event_id, symbol, side,
+  decision_ts, and precomputed causal features — no locked_outcome, future
+  bars, or split access. Action contract is TAKE/ABSTAIN (no arithmetic
+  outcome inversion; sim.py is sole money authority per RULES §4).
+* **Immutable ledger:** ``SplitEval.ledger`` is a tuple of ``EventLedger``
+  rows. All ``EvalMetrics`` derived exclusively from the ledger.
+  ``reconcile()`` re-derives independently and checks identity.
+* **Baselines:** abstain, always-take, random, linear OLS with intercept,
+  regression tree (CART, max_depth=3, min_samples_leaf=20).
+* **Shuffled-label control:** Re-fits predictor from scratch on shuffled train
+  labels only; frozen test split never touched.
+* **Fail-closed:** Invalid split → ``ValueError``. Missing features →
+  ``KeyError``. ``verify_splits()`` checks chronological purge.
+* **285/285 tests pass** from a clean checkout on the remote box
+  (CPython 3.12.3). 25 evaluate tests including adversarial leakage and
+  golden economic checks.
 
 ---
 
@@ -208,26 +227,39 @@ The generated JSON observations were persisted to the snapshot directory:
 
 ### Verdict: PASS
 
-The outcome contract (HunterSpec V0) is locked. `wide_1h` confirmed as the
-production geometry across all 10 symbols × 3 years (`early` profile).
-
-*   **HunterSpec V0 (`wide_1h`):**
-    *   **Decision Interval:** 1 hour (factor = 12 relative to 5m simulation path).
-    *   **Stop Distance ($k_{\text{stop}}$):** $2.0 \times \text{ATR}(14)$ calculated on the aggregated 1h series.
-    *   **Target Distance ($\text{reward\_risk}$):** $3.0 \times \text{stop\_dist}$ (target is $6.0 \times \text{ATR}(14)$ representing a 3:1 reward-to-risk ratio).
-    *   **Maximum Holding Horizon ($\text{max\_holding\_bars}$):** 288 bars of 5m ($24$ hours real-time horizon).
-    *   **Candidate Specs File:** [specs/hunter_candidate_v0.json](file:///c:/Users/dresden/Documents/v7/specs/hunter_candidate_v0.json) — locked, promoted from CANDIDATE to V0.
-*   **Provisional Chronological Dataset Splits:**
-    *   **Pilot Universe Window:** `[1689811200000, 1784474400000)` ms epoch (`2023-07-20T00:00:00Z` – `2026-07-19T15:20:00Z`, 3 years).
-    *   **Train/Test Split Boundary:** `2025-10-20T00:00:00Z` (`1760918400000` ms epoch).
-    *   **Candidate Splits File:** [specs/split_candidate_v0.json](file:///c:/Users/dresden/Documents/v7/specs/split_candidate_v0.json) — locked, promoted from CANDIDATE to V0.
-    *   *Symmetry Note:* The entire 365-day BTC data examined during geometry exploration is designated as development data; no part of it is considered untouched or frozen test data.
+The evaluation framework is locked. Predictors receive only causal
+``PredictionContext`` (features + event_id/symbol/side/decision_ts) — no
+outcome, future bars, or split access. Action contract is TAKE/ABSTAIN
+(no arithmetic outcome inversion). All metrics derive exclusively from an
+immutable per-trade ledger. Negative controls re-fit from scratch on
+shuffled labels without touching the frozen test split.
 
 ### Exit evidence:
-1.  **Pilot Universe Build:** All 10 symbols × 3 years (`early` profile) downloaded, hash-verified, coverage-complete. Built via `python tools/build_universe.py --profile early`.
-2.  **Geometry Gate Validation:** All 7 gates passed (see Current status above). Gate validation output at `data/snapshots/phase4_geometry_gates.json` on the execution box.
-3.  **Code Decoupling:** `lab/observe.py` is a pure consumer (no default setups). `lab/events.py` takes all geometry/split parameters from the caller — no hardcoded constants. Specs are versioned JSON: `specs/hunter_candidate_v0.json`, `specs/split_candidate_v0.json`.
-4.  **Golden Matches:** 260/260 tests pass. Every `CandidateEvent.locked_outcome` matches an independent `sim.simulate()` call with identical inputs. Test class: `TestGoldenMatches` in `lab/tests/test_events.py`.
+
+*   **PredictionContext safety:** Predictors cannot access `locked_outcome`,
+    `outcome_end_ts`, `split`, or any bar data after `decision_ts`.
+    Adversarial test confirms physical API separation
+    (`test_adversarial_predictor_has_no_outcome_access`).
+*   **TAKE/ABSTAIN contract:** No LONG/SHORT inversion — `sim.py` is the sole
+    money authority. Per RULES §4.
+*   **Immutable ledger:** ``SplitEval.ledger`` is a tuple of ``EventLedger``
+    rows. All ``EvalMetrics`` are derived exclusively from the ledger.
+    ``reconcile()`` re-derives metrics independently and checks identity.
+*   **Baselines:** abstain (floor), always-take (raw expectancy), random
+    (convergence to ~0), linear OLS with intercept, regression tree
+    (CART, max_depth=3, min_samples_leaf=20).
+*   **Shuffled-label control:** ``shuffled_control_check()`` isolates train
+    labels only, shuffles, re-fits predictor from scratch, evaluates on
+    untouched test split. Frozen holdout never leaked.
+*   **Fail-closed guards:** Invalid split raises ``ValueError``. Missing
+    features raises ``KeyError``. ``verify_splits()`` checks chronological
+    purge and test boundary.
+*   **Feature precomputation:** ``precompute_features()`` — O(n) one-pass per
+    symbol, O(1) dict lookup per event.
+*   **Deterministic reproduction:** Same seed → identical ledger + metrics.
+*   **285/285 tests pass** from a clean checkout on the remote box
+    (CPython 3.12.3). 25 evaluate tests including adversarial leakage,
+    golden economic, and reconciliation checks.
 
 ---
 

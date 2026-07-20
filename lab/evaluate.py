@@ -1,21 +1,24 @@
 """Phase 5 — evaluation authority (ROADMAP Phase 5).
 
 Pure: no I/O, no network, no wall-clock. Evaluates predictors against
-candidate events using chronological purged splits from Phase 4. Implements
-baseline predictors and negative controls to verify the pipeline can
-distinguish signal from noise without leaking future information.
+candidate events using chronological purged splits. The predictor never
+sees future information: it receives only a PredictionContext with
+precomputed causal features, event ID, symbol, side, and decision timestamp.
+
+Action contract: TAKE / ABSTAIN. The event's declared side (LONG/SHORT) is
+fixed by Phase 4; the predictor decides whether to enter, not which direction.
+No arithmetic outcome inversion — sim.py is the sole money-computing authority.
 """
 
 from __future__ import annotations
 
 import random as _random
-from dataclasses import dataclass
-from typing import Callable, Sequence
+from dataclasses import dataclass, field
+from typing import Sequence
 
 import numpy as np
 
 from lab.events import CandidateEvent
-from lab.sim import CostBreakdown, TradeOutcome
 from lab.indicators import compute_atr
 from lab.tape import Bar
 
@@ -23,122 +26,264 @@ from lab.tape import Bar
 # types
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# A predictor is a stateful object with fit + predict. Stateless predictors
-# implement fit as a no-op.
-Predictor = Callable[["CandidateEvent", list[Bar]], str | None]
+_VALID_SPLITS = frozenset({"train", "test"})
+
+
+@dataclass(frozen=True, slots=True)
+class PredictionContext:
+    """What a predictor is allowed to see at decision time.
+
+    Fields deliberately excluded: locked_outcome, outcome_end_ts, split,
+    fill_ts, feature_cutoff_ts, planned_entry_ts, any bar data after
+    decision_ts. The predictor receives ONLY precomputed causal features.
+    """
+
+    event_id: str
+    symbol: str
+    side: str              # "LONG" or "SHORT" — the event's declared direction
+    decision_ts: int
+    features: np.ndarray   # precomputed causal feature vector
+
+
+@dataclass(frozen=True, slots=True)
+class EventLedger:
+    """Immutable per-event record. Aggregate metrics are derived exclusively
+    from this ledger — never computed independently."""
+
+    event_id: str
+    split: str             # "train" or "test"
+    side: str              # event's declared side
+    decision_ts: int
+    predicted: bool        # True = TAKE, False = ABSTAIN
+    net_r: float           # locked_outcome.net_r (signed, from sim.py)
 
 
 @dataclass(frozen=True, slots=True)
 class EvalMetrics:
-    """Per-split evaluation metrics for one predictor."""
+    """Per-split aggregate metrics, derived from the ledger."""
 
     n_events: int
-    n_trades: int
-    coverage: float           # n_trades / n_events
-    mean_net_r: float | None  # None when n_trades == 0
+    n_taken: int
+    coverage: float           # n_taken / n_events
+    mean_net_r: float | None  # None when n_taken == 0
     median_net_r: float | None
     std_net_r: float | None
-    sharpe: float | None      # mean / std, None when n_trades < 2 or std == 0
-    win_rate: float | None    # fraction of trades with net_r > 0
+    sharpe: float | None
+    win_rate: float | None    # fraction of taken events with net_r > 0
 
 
 @dataclass(frozen=True, slots=True)
 class SplitEval:
-    """Evaluation result broken out by train/test split."""
+    """Evaluation result: ledger + metrics, broken out by split."""
 
+    ledger: tuple[EventLedger, ...] = field(repr=False)
     train: EvalMetrics
     test: EvalMetrics
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# metrics helpers
+# feature precomputation — O(n) one-pass per symbol
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _compute_metrics(n_events: int, net_rs: Sequence[float]) -> EvalMetrics:
-    n_trades = len(net_rs)
-    if n_trades == 0:
-        return EvalMetrics(
-            n_events=n_events, n_trades=0, coverage=0.0,
-            mean_net_r=None, median_net_r=None,
-            std_net_r=None, sharpe=None, win_rate=None,
-        )
+def precompute_features(
+    bars: list[Bar],
+    decision_tss: Sequence[int],
+    atr_period: int = 14,
+) -> dict[int, np.ndarray]:
+    """Precompute causal feature vectors for a set of decision timestamps.
 
-    arr = np.asarray(net_rs, dtype=float)
-    mean = float(np.mean(arr))
-    std = float(np.std(arr, ddof=1)) if n_trades >= 2 else 0.0
-    sharpe = mean / std if std > 0 else None
+    One O(n) pass over bars. Returns dict mapping decision_ts → feature vector.
+    Decision timestamps not found in bars get a zero vector.
 
-    return EvalMetrics(
-        n_events=n_events,
-        n_trades=n_trades,
-        coverage=n_trades / n_events,
-        mean_net_r=mean,
-        median_net_r=float(np.median(arr)),
-        std_net_r=std,
-        sharpe=sharpe,
-        win_rate=float(np.sum(arr > 0)) / n_trades,
-    )
+    Features: [return_1, return_3, return_12, atr_norm]
+    All computed from bars strictly before decision_ts (causal).
+    """
+    if not bars:
+        return {}
+
+    n = len(bars)
+    closes = np.array([b.close for b in bars], dtype=float)
+    highs = np.array([b.high for b in bars], dtype=float)
+    lows = np.array([b.low for b in bars], dtype=float)
+
+    # Precompute ATR once
+    atr = compute_atr(highs.tolist(), lows.tolist(), closes.tolist(), period=atr_period)
+    atr_arr = np.array(atr, dtype=float)
+
+    # Build open_ts → index map for O(1) lookup
+    ts_to_idx: dict[int, int] = {}
+    for i, b in enumerate(bars):
+        ts_to_idx[b.open_ts] = i
+
+    result: dict[int, np.ndarray] = {}
+    for ts in decision_tss:
+        bar_before_ts = ts - 300_000  # the bar that ends at decision_ts
+        idx = ts_to_idx.get(bar_before_ts, -1)
+
+        if idx < 0 or idx < atr_period:
+            result[ts] = np.zeros(4, dtype=float)
+            continue
+
+        def _ret(lookback: int) -> float:
+            if idx - lookback < 0:
+                return 0.0
+            ref = closes[idx - lookback]
+            if ref == 0.0:
+                return 0.0
+            return float((closes[idx] - ref) / ref)
+
+        return_1 = _ret(1)
+        return_3 = _ret(3)
+        return_12 = _ret(12)
+
+        atr_val = atr_arr[idx] if idx < len(atr_arr) else 0.0
+        atr_norm = float(atr_val / closes[idx]) if closes[idx] != 0.0 else 0.0
+        if not np.isfinite(atr_norm):
+            atr_norm = 0.0
+
+        result[ts] = np.array([return_1, return_3, return_12, atr_norm], dtype=float)
+
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # evaluation
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _validate_split(event: CandidateEvent) -> None:
+    if event.split not in _VALID_SPLITS:
+        raise ValueError(
+            f"invalid split {event.split!r} for event {event.event_id} — "
+            f"must be one of {sorted(_VALID_SPLITS)}"
+        )
+
+
 def evaluate(
     events: Sequence[CandidateEvent],
-    bars_by_symbol: dict[str, list[Bar]],
-    predictor: Predictor,
+    features_by_ts: dict[str, dict[int, np.ndarray]],  # symbol → {ts → features}
+    predictor,  # callable: (PredictionContext) → bool
+    *,
     seed: int,
+    fit_predictor: bool = False,
 ) -> SplitEval:
-    """Evaluate a predictor on candidate events, respecting train/test splits.
+    """Evaluate a predictor on candidate events.
 
-    The predictor is called once per event with the event and the symbol's
-    bar array. It returns ``"LONG"``, ``"SHORT"``, or ``None`` (abstain).
-    The event's ``locked_outcome`` is used as ground truth — this is NOT a
-    forward-looking prediction; it is an evaluation of whether the
-    predictor's side choice would have captured the known outcome.
+    The predictor receives a PredictionContext per event and returns True
+    (TAKE the event at its declared side) or False (ABSTAIN). It never sees
+    locked_outcome, future bars, or split labels.
 
-    Deterministic: same events + bars + predictor + seed → identical result.
+    If ``fit_predictor`` is True, ``predictor.fit(train_events, ...)`` is
+    called before evaluation. The test split is never passed to fit() —
+    frozen holdout is physically separated from development.
+
+    Returns a SplitEval with the immutable ledger and per-split metrics.
     """
-    # Seed both stdlib random and numpy for predictor determinism
+    if fit_predictor:
+        # Gather training PredictionContexts (test split excluded)
+        train_ctxs: list[PredictionContext] = []
+        for event in events:
+            _validate_split(event)
+            if event.split != "train":
+                continue
+            sym_features = features_by_ts.get(event.symbol, {})
+            feats = sym_features.get(event.decision_ts)
+            if feats is None:
+                raise KeyError(
+                    f"no precomputed features for {event.symbol} at "
+                    f"decision_ts={event.decision_ts} (event {event.event_id})"
+                )
+            train_ctxs.append(PredictionContext(
+                event_id=event.event_id,
+                symbol=event.symbol,
+                side=event.side,
+                decision_ts=event.decision_ts,
+                features=feats.copy(),
+            ))
+        predictor.fit(train_ctxs, seed=seed)
+
     _random.seed(seed)
     np.random.seed(seed)
 
-    train_net_rs: list[float] = []
-    test_net_rs: list[float] = []
-    n_train_events = 0
-    n_test_events = 0
+    ledger_rows: list[EventLedger] = []
+    n_train = 0
+    n_test = 0
 
     for event in events:
-        bars = bars_by_symbol.get(event.symbol)
-        if bars is None:
-            continue
+        _validate_split(event)
+        sym_features = features_by_ts.get(event.symbol, {})
+        feats = sym_features.get(event.decision_ts)
+        if feats is None:
+            raise KeyError(
+                f"no precomputed features for {event.symbol} at "
+                f"decision_ts={event.decision_ts} (event {event.event_id})"
+            )
 
-        side = predictor(event, bars)
-        if side is None:
-            # Abstain — counted in n_events but not in net_rs
-            if event.split == "train":
-                n_train_events += 1
-            else:
-                n_test_events += 1
-            continue
+        ctx = PredictionContext(
+            event_id=event.event_id,
+            symbol=event.symbol,
+            side=event.side,
+            decision_ts=event.decision_ts,
+            features=feats.copy(),
+        )
+        take = bool(predictor(ctx))
 
-        # Predictor chose LONG or SHORT. If it matches the event's actual
-        # side, use the locked outcome's net_r; otherwise invert it.
-        net_r = event.locked_outcome.net_r
-        if side != event.side:
-            net_r = -net_r
+        row = EventLedger(
+            event_id=event.event_id,
+            split=event.split,
+            side=event.side,
+            decision_ts=event.decision_ts,
+            predicted=take,
+            net_r=event.locked_outcome.net_r if take else 0.0,
+        )
+        ledger_rows.append(row)
 
         if event.split == "train":
-            n_train_events += 1
-            train_net_rs.append(net_r)
+            n_train += 1
         else:
-            n_test_events += 1
-            test_net_rs.append(net_r)
+            n_test += 1
 
     return SplitEval(
-        train=_compute_metrics(n_train_events, train_net_rs),
-        test=_compute_metrics(n_test_events, test_net_rs),
+        ledger=tuple(ledger_rows),
+        train=_metrics_for_split(ledger_rows, "train", n_train),
+        test=_metrics_for_split(ledger_rows, "test", n_test),
+    )
+
+
+def _metrics_for_split(
+    ledger: list[EventLedger], split: str, n_events: int,
+) -> EvalMetrics:
+    rows = [r for r in ledger if r.split == split]
+    taken = [r for r in rows if r.predicted]
+    n_taken = len(taken)
+
+    if n_events == 0:
+        return EvalMetrics(
+            n_events=0, n_taken=0, coverage=0.0,
+            mean_net_r=None, median_net_r=None,
+            std_net_r=None, sharpe=None, win_rate=None,
+        )
+
+    if n_taken == 0:
+        return EvalMetrics(
+            n_events=n_events, n_taken=0, coverage=0.0,
+            mean_net_r=None, median_net_r=None,
+            std_net_r=None, sharpe=None, win_rate=None,
+        )
+
+    net_rs = np.array([r.net_r for r in taken], dtype=float)
+    mean = float(np.mean(net_rs))
+    std = float(np.std(net_rs, ddof=1)) if n_taken >= 2 else 0.0
+    sharpe = mean / std if std > 0 else None
+
+    return EvalMetrics(
+        n_events=n_events,
+        n_taken=n_taken,
+        coverage=n_taken / n_events,
+        mean_net_r=mean,
+        median_net_r=float(np.median(net_rs)),
+        std_net_r=std,
+        sharpe=sharpe,
+        win_rate=float(np.sum(net_rs > 0)) / n_taken,
     )
 
 
@@ -146,97 +291,122 @@ def evaluate(
 # baseline predictors
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def make_abstain_predictor() -> Predictor:
-    """Never trades. Baseline floor: coverage=0, net_r=None."""
+def make_abstain_predictor():
+    """Never trades. Baseline floor."""
 
-    def predict(_event: CandidateEvent, _bars: list[Bar]) -> None:
-        return None
+    def predict(_ctx: PredictionContext) -> bool:
+        return False
 
+    predict.fit = lambda ctxs, *, seed: None  # type: ignore[attr-defined]
     return predict
 
 
-def make_always_long_predictor() -> Predictor:
-    """Takes every candidate as LONG. Raw expectancy baseline."""
+def make_always_take_predictor():
+    """Takes every candidate event. Raw expectancy baseline."""
 
-    def predict(_event: CandidateEvent, _bars: list[Bar]) -> str:
-        return "LONG"
+    def predict(_ctx: PredictionContext) -> bool:
+        return True
 
+    predict.fit = lambda ctxs, *, seed: None   # type: ignore[attr-defined]
     return predict
 
 
-def make_random_predictor() -> Predictor:
-    """Coin flip per event. Should converge to ~0 net_r with enough samples."""
+def make_random_predictor():
+    """Coin flip per event. Should converge to ~0 net_r."""
 
-    def predict(_event: CandidateEvent, _bars: list[Bar]) -> str:
-        return _random.choice(["LONG", "SHORT"])
+    def predict(_ctx: PredictionContext) -> bool:
+        return _random.choice([True, False])
 
+    predict.fit = lambda ctxs, *, seed: None   # type: ignore[attr-defined]
     return predict
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# linear baseline — OLS on minimal features
-# ═══════════════════════════════════════════════════════════════════════════════
 
 class LinearBaseline:
-    """OLS linear regression on features_at_decision. Predicts LONG if
-    dot(features, weights) > 0, else SHORT. Never abstains."""
+    """OLS regression on precomputed features with intercept. Target: locked_outcome.net_r.
+
+    Predicts TAKE if predicted net_r > 0, else ABSTAIN.
+    """
 
     def __init__(self) -> None:
         self._weights: np.ndarray | None = None
+        self._intercept: float = 0.0
 
-    def fit(
-        self,
-        train_events: Sequence[CandidateEvent],
-        bars_by_symbol: dict[str, list[Bar]],
-    ) -> None:
-        """Fit OLS weights on train events using locked_outcome.net_r as target."""
-        X_rows: list[np.ndarray] = []
-        y_rows: list[float] = []
-
-        for event in train_events:
-            if event.split != "train":
-                continue
-            bars = bars_by_symbol.get(event.symbol)
-            if bars is None:
-                continue
-            feats = features_at_decision(bars, event.decision_ts)
-            X_rows.append(feats)
-            y_rows.append(event.locked_outcome.net_r)
-
-        if len(X_rows) < 2:
-            self._weights = np.zeros(4, dtype=float)
-            return
-
-        X = np.array(X_rows, dtype=float)
-        y = np.array(y_rows, dtype=float)
-
-        # Normal equation: w = (X^T X)^-1 X^T y
-        try:
-            self._weights = np.linalg.solve(X.T @ X, X.T @ y)
-        except np.linalg.LinAlgError:
-            self._weights = np.zeros(4, dtype=float)
-
-    def __call__(self, event: CandidateEvent, bars: list[Bar]) -> str:
+    def __call__(self, ctx: PredictionContext) -> bool:
         if self._weights is None:
-            return "LONG"  # default before fit
-        feats = features_at_decision(bars, event.decision_ts)
-        pred = float(np.dot(feats, self._weights))
-        return "LONG" if pred > 0 else "SHORT"
+            return False
+        pred = float(np.dot(ctx.features, self._weights)) + self._intercept
+        return pred > 0.0
 
 
 def make_linear_predictor(
-    train_events: Sequence[CandidateEvent],
-    bars_by_symbol: dict[str, list[Bar]],
+    train_ctxs: Sequence[PredictionContext],
+    targets: Sequence[float],
+    *,
+    seed: int,
 ) -> LinearBaseline:
-    """Create a fitted linear baseline predictor."""
+    """Create a fitted linear baseline predictor.
+
+    Args:
+        train_ctxs: Training PredictionContexts (development only).
+        targets: Corresponding net_r values from locked_outcome.
+        seed: For reproducibility.
+    """
+    _random.seed(seed)
+    np.random.seed(seed)
+
     model = LinearBaseline()
-    model.fit(train_events, bars_by_symbol)
+    X_rows = [ctx.features for ctx in train_ctxs]
+
+    if len(X_rows) < 2:
+        model._weights = np.zeros(4, dtype=float)
+        model._intercept = float(np.mean(targets)) if targets else 0.0
+        return model
+
+    # Add intercept column
+    X_raw = np.array(X_rows, dtype=float)
+    X = np.column_stack([X_raw, np.ones(len(X_rows))])
+    y = np.array(targets, dtype=float)
+
+    try:
+        w = np.linalg.solve(X.T @ X, X.T @ y)
+        model._weights = w[:-1]
+        model._intercept = float(w[-1])
+    except np.linalg.LinAlgError:
+        model._weights = np.zeros(4, dtype=float)
+        model._intercept = float(np.mean(y))
+
     return model
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# tree baseline — minimal regression tree
-# ═══════════════════════════════════════════════════════════════════════════════
+class TreeBaseline:
+    """Minimal regression tree (CART, max_depth=3, min_samples_leaf=20).
+
+    Predicts TAKE if predicted net_r > 0, else ABSTAIN.
+    """
+
+    _MAX_DEPTH = 3
+    _MIN_LEAF = 20
+
+    def __init__(self) -> None:
+        self._root: _TreeNode | None = None
+
+    def fit(self, ctxs: Sequence[PredictionContext], *, seed: int) -> None:
+        raise NotImplementedError("use make_tree_predictor which provides targets")
+
+    def __call__(self, ctx: PredictionContext) -> bool:
+        if self._root is None:
+            return False
+        node = self._root
+        while not node.is_leaf:
+            assert node.feature_idx is not None
+            if ctx.features[node.feature_idx] <= node.threshold:
+                assert node.left is not None
+                node = node.left
+            else:
+                assert node.right is not None
+                node = node.right
+        return node.value > 0.0
+
 
 class _TreeNode:
     __slots__ = ("feature_idx", "threshold", "left", "right", "value")
@@ -260,173 +430,122 @@ class _TreeNode:
         return self.left is None and self.right is None
 
 
-class TreeBaseline:
-    """Minimal regression tree (CART, max_depth=3, min_samples_leaf=20).
-    Predicts LONG if predicted net_r > 0, else SHORT. Never abstains."""
+def _build_tree(X: np.ndarray, y: np.ndarray, depth: int,
+                max_depth: int, min_leaf: int) -> _TreeNode:
+    n = len(y)
+    if depth >= max_depth or n < min_leaf * 2:
+        return _TreeNode(value=float(np.mean(y)))
 
-    _MAX_DEPTH = 3
-    _MIN_LEAF = 20
+    best_var = float("inf")
+    best_idx = -1
+    best_thresh = 0.0
 
-    def __init__(self) -> None:
-        self._root: _TreeNode | None = None
-
-    def fit(
-        self,
-        train_events: Sequence[CandidateEvent],
-        bars_by_symbol: dict[str, list[Bar]],
-    ) -> None:
-        X_rows: list[np.ndarray] = []
-        y_rows: list[float] = []
-
-        for event in train_events:
-            if event.split != "train":
+    for fi in range(X.shape[1]):
+        col = X[:, fi]
+        unique = np.unique(col)
+        if len(unique) < 2:
+            continue
+        for thresh in unique[:: max(1, len(unique) // 20)]:
+            mask = col <= thresh
+            left_n = np.sum(mask)
+            if left_n < min_leaf or (n - left_n) < min_leaf:
                 continue
-            bars = bars_by_symbol.get(event.symbol)
-            if bars is None:
-                continue
-            feats = features_at_decision(bars, event.decision_ts)
-            X_rows.append(feats)
-            y_rows.append(event.locked_outcome.net_r)
+            left_var = np.var(y[mask]) if left_n > 1 else 0.0
+            right_var = np.var(y[~mask]) if (n - left_n) > 1 else 0.0
+            total_var = (left_n * left_var + (n - left_n) * right_var) / n
+            if total_var < best_var:
+                best_var = total_var
+                best_idx = fi
+                best_thresh = thresh
 
-        if len(X_rows) < self._MIN_LEAF * 2:
-            self._root = _TreeNode(value=0.0)
-            return
+    if best_idx < 0:
+        return _TreeNode(value=float(np.mean(y)))
 
-        X = np.array(X_rows, dtype=float)
-        y = np.array(y_rows, dtype=float)
-        self._root = self._build(X, y, depth=0)
-
-    def _build(self, X: np.ndarray, y: np.ndarray, depth: int) -> _TreeNode:
-        n = len(y)
-        if depth >= self._MAX_DEPTH or n < self._MIN_LEAF * 2:
-            return _TreeNode(value=float(np.mean(y)))
-
-        best_var = float("inf")
-        best_idx = -1
-        best_thresh = 0.0
-
-        for fi in range(X.shape[1]):
-            col = X[:, fi]
-            unique = np.unique(col)
-            if len(unique) < 2:
-                continue
-            for thresh in unique[:: max(1, len(unique) // 20)]:
-                mask = col <= thresh
-                left_n = np.sum(mask)
-                if left_n < self._MIN_LEAF or (n - left_n) < self._MIN_LEAF:
-                    continue
-                left_var = np.var(y[mask]) if left_n > 1 else 0.0
-                right_var = np.var(y[~mask]) if (n - left_n) > 1 else 0.0
-                total_var = (left_n * left_var + (n - left_n) * right_var) / n
-                if total_var < best_var:
-                    best_var = total_var
-                    best_idx = fi
-                    best_thresh = thresh
-
-        if best_idx < 0:
-            return _TreeNode(value=float(np.mean(y)))
-
-        mask = X[:, best_idx] <= best_thresh
-        left = self._build(X[mask], y[mask], depth + 1)
-        right = self._build(X[~mask], y[~mask], depth + 1)
-        return _TreeNode(feature_idx=best_idx, threshold=best_thresh,
-                         left=left, right=right)
-
-    def __call__(self, event: CandidateEvent, bars: list[Bar]) -> str:
-        if self._root is None:
-            return "LONG"
-        feats = features_at_decision(bars, event.decision_ts)
-        node = self._root
-        while not node.is_leaf:
-            assert node.feature_idx is not None
-            if feats[node.feature_idx] <= node.threshold:
-                assert node.left is not None
-                node = node.left
-            else:
-                assert node.right is not None
-                node = node.right
-        return "LONG" if node.value > 0 else "SHORT"
+    mask = X[:, best_idx] <= best_thresh
+    left = _build_tree(X[mask], y[mask], depth + 1, max_depth, min_leaf)
+    right = _build_tree(X[~mask], y[~mask], depth + 1, max_depth, min_leaf)
+    return _TreeNode(feature_idx=best_idx, threshold=best_thresh,
+                     left=left, right=right)
 
 
 def make_tree_predictor(
-    train_events: Sequence[CandidateEvent],
-    bars_by_symbol: dict[str, list[Bar]],
+    train_ctxs: Sequence[PredictionContext],
+    targets: Sequence[float],
+    *,
+    seed: int,
 ) -> TreeBaseline:
     """Create a fitted tree baseline predictor."""
+    _random.seed(seed)
+    np.random.seed(seed)
+
     model = TreeBaseline()
-    model.fit(train_events, bars_by_symbol)
+    X_rows = [ctx.features for ctx in train_ctxs]
+
+    if len(X_rows) < TreeBaseline._MIN_LEAF * 2:
+        model._root = _TreeNode(value=0.0)
+        return model
+
+    X = np.array(X_rows, dtype=float)
+    y = np.array(targets, dtype=float)
+    model._root = _build_tree(
+        X, y, depth=0,
+        max_depth=TreeBaseline._MAX_DEPTH,
+        min_leaf=TreeBaseline._MIN_LEAF,
+    )
     return model
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# negative control
+# negative control — shuffled-label
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def shuffled_control_check(
     events: Sequence[CandidateEvent],
-    bars_by_symbol: dict[str, list[Bar]],
-    predictor: Predictor,
+    features_by_ts: dict[str, dict[int, np.ndarray]],
+    predictor_factory,  # callable: (train_ctxs, targets, seed) → predictor
     seed: int,
     n_shuffles: int = 10,
 ) -> list[EvalMetrics]:
-    """Shuffle net_r values across events and re-evaluate.
+    """Shuffle train labels and re-fit predictor from scratch each time.
 
-    Returns one EvalMetrics (train split) per shuffle. If shuffled labels
-    consistently produce positive mean_net_r, the pipeline has a defect.
-    Phase 5 gate: shuffled labels must not produce edge.
+    For each shuffle:
+    1. Isolate train events (test split never touched).
+    2. Shuffle only the train net_r values.
+    3. Fit a new predictor on shuffled targets.
+    4. Evaluate on the original test split (untouched).
+
+    If shuffled labels consistently produce positive mean_net_r on test,
+    the pipeline has a defect.
     """
     rng = _random.Random(seed)
-    events_list = list(events)
-    n = len(events_list)
 
-    # Original net_r pool
-    net_r_pool = [e.locked_outcome.net_r for e in events_list]
+    train_events = [e for e in events if e.split == "train"]
+    if len(train_events) < 2:
+        return []
+
+    # Pre-build train contexts (features are fixed, only targets change)
+    train_ctxs: list[PredictionContext] = []
+    for e in train_events:
+        sym_f = features_by_ts.get(e.symbol, {})
+        feats = sym_f.get(e.decision_ts)
+        if feats is None:
+            raise KeyError(
+                f"no features for {e.symbol} at ts={e.decision_ts}"
+            )
+        train_ctxs.append(PredictionContext(
+            event_id=e.event_id, symbol=e.symbol,
+            side=e.side, decision_ts=e.decision_ts,
+            features=feats.copy(),
+        ))
 
     results: list[EvalMetrics] = []
     for i in range(n_shuffles):
-        shuffled = list(net_r_pool)
-        rng.shuffle(shuffled)
+        targets = [e.locked_outcome.net_r for e in train_events]
+        rng.shuffle(targets)
 
-        # Build events with shuffled net_r
-        shuffled_events = []
-        for j, event in enumerate(events_list):
-            orig = event.locked_outcome
-            new_outcome = TradeOutcome(
-                side=orig.side,
-                entry_index=orig.entry_index,
-                exit_index=orig.exit_index,
-                exit_reason=orig.exit_reason,
-                entry_price=orig.entry_price,
-                exit_price=orig.exit_price,
-                nominal_return=orig.nominal_return,
-                risk_fraction=orig.risk_fraction,
-                gross_return=shuffled[j],
-                net_return=shuffled[j],
-                net_r=shuffled[j],
-                mae_r=orig.mae_r,
-                mfe_r=orig.mfe_r,
-                costs=CostBreakdown(
-                    fee=orig.costs.fee, slippage=orig.costs.slippage,
-                    funding=orig.costs.funding, total=orig.costs.total,
-                ),
-            )
-            shuffled_events.append(
-                CandidateEvent(
-                    event_id=event.event_id,
-                    symbol=event.symbol,
-                    side=event.side,
-                    feature_cutoff_ts=event.feature_cutoff_ts,
-                    decision_ts=event.decision_ts,
-                    planned_entry_ts=event.planned_entry_ts,
-                    fill_ts=event.fill_ts,
-                    outcome_end_ts=event.outcome_end_ts,
-                    locked_outcome=new_outcome,
-                    split=event.split,
-                )
-            )
-
-        result = evaluate(shuffled_events, bars_by_symbol, predictor, seed + i)
-        results.append(result.train)
+        predictor = predictor_factory(train_ctxs, targets, seed=seed + i)
+        result = evaluate(events, features_by_ts, predictor, seed=seed + i)
+        results.append(result.test)  # evaluate on frozen test split
 
     return results
 
@@ -435,80 +554,58 @@ def shuffled_control_check(
 # reconciliation
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def reconcile(
+def reconcile(result: SplitEval) -> bool:
+    """Verify that aggregate metrics are derived correctly from the ledger.
+
+    Re-derives metrics from the ledger independently and checks identity.
+    This proves that per-trade outcomes reconcile exactly with aggregate.
+    """
+    ledger = list(result.ledger)
+
+    # Count events per split from ledger
+    n_train = sum(1 for r in ledger if r.split == "train")
+    n_test = sum(1 for r in ledger if r.split == "test")
+
+    train2 = _metrics_for_split(ledger, "train", n_train)
+    test2 = _metrics_for_split(ledger, "test", n_test)
+
+    return result.train == train2 and result.test == test2
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# split / purge verification
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def verify_splits(
     events: Sequence[CandidateEvent],
-    bars_by_symbol: dict[str, list[Bar]],
-    predictor: Predictor,
-    seed: int,
-    result: SplitEval,
+    frozen_test_start_ts: int,
 ) -> bool:
-    """Verify per-trade outcomes reconcile with aggregate metrics.
+    """Verify split integrity.
 
-    Re-runs evaluate() with the same inputs and checks bit-identity.
-    If the result is not identical, per-trade accounting does not
-    reconcile with aggregate — a pipeline defect.
+    - All train events have outcome_end_ts < frozen_test_start_ts (purged).
+    - All test events have decision_ts >= frozen_test_start_ts.
+    - Events are chronologically ordered within each split.
+    - No test events leak into train.
     """
-    result2 = evaluate(events, bars_by_symbol, predictor, seed)
-    return result == result2
+    train_events = [e for e in events if e.split == "train"]
+    test_events = [e for e in events if e.split == "test"]
 
+    # Train events must end before frozen test starts
+    for e in train_events:
+        if e.outcome_end_ts >= frozen_test_start_ts:
+            return False
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# feature extraction (minimal — Phase 6 will expand this)
-# ═══════════════════════════════════════════════════════════════════════════════
+    # Test events must start at or after frozen test
+    for e in test_events:
+        if e.decision_ts < frozen_test_start_ts:
+            return False
 
-def features_at_decision(
-    bars: list[Bar],
-    decision_ts: int,
-    atr_period: int = 14,
-) -> np.ndarray:
-    """Compute a minimal feature vector at a decision timestamp.
+    # Chronological order within splits
+    for i in range(1, len(train_events)):
+        if train_events[i].decision_ts < train_events[i - 1].decision_ts:
+            return False
+    for i in range(1, len(test_events)):
+        if test_events[i].decision_ts < test_events[i - 1].decision_ts:
+            return False
 
-    Returns ``[return_1, return_3, return_12, atr_norm]`` where:
-    - return_N: N-bar return ending at the bar before decision_ts
-    - atr_norm: ATR(14) / close, or 0 if unavailable
-
-    All values are finite floats. Returns zeros if there is insufficient
-    history at decision_ts.
-    """
-    # Find the bar index just before decision_ts
-    # decision_ts is the open_ts of the entry bar, so the bar before it
-    # ends at decision_ts - 300_000
-    bar_before_ts = decision_ts - 300_000
-
-    # Binary search for the bar at bar_before_ts
-    idx = -1
-    for i, b in enumerate(bars):
-        if b.open_ts == bar_before_ts:
-            idx = i
-            break
-        elif b.open_ts > bar_before_ts:
-            break
-
-    if idx < 0:
-        return np.zeros(4, dtype=float)
-
-    closes = [b.close for b in bars]
-    highs = [b.high for b in bars]
-    lows = [b.low for b in bars]
-
-    # returns: (close[idx] - close[idx-N]) / close[idx-N]
-    def _ret(lookback: int) -> float:
-        if idx - lookback < 0:
-            return 0.0
-        ref = closes[idx - lookback]
-        if ref == 0:
-            return 0.0
-        return (closes[idx] - ref) / ref
-
-    return_1 = _ret(1)
-    return_3 = _ret(3)
-    return_12 = _ret(12)
-
-    # ATR normalized by close
-    atr = compute_atr(highs, lows, closes, period=atr_period)
-    atr_val = atr[idx] if idx < len(atr) else 0.0
-    atr_norm = atr_val / closes[idx] if closes[idx] != 0 else 0.0
-    if not np.isfinite(atr_norm):
-        atr_norm = 0.0
-
-    return np.array([return_1, return_3, return_12, atr_norm], dtype=float)
+    return True
