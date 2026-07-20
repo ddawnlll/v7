@@ -423,6 +423,29 @@ def make_tree_predictor(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Phase 6 — hypothesis predictor
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def make_momentum_alignment_predictor():
+    """Hypothesis H1: directional momentum alignment.
+
+    TAKE when return_5m > 0 AND return_1h > 0, ABSTAIN otherwise.
+    Both features are sign-flipped for SHORT events (features.py), so
+    positive = aligned with event direction regardless of LONG/SHORT.
+
+    Rationale: when recent short-term momentum (5m) and medium-term
+    momentum (1h) both point in the same direction as the candidate
+    event, the trend is confirmed — indicating higher likelihood of
+    continuation than when signals disagree.
+    """
+    def predict(ctx: PredictionContext) -> bool:
+        return float(ctx.features[0]) > 0.0 and float(ctx.features[2]) > 0.0
+
+    predict.fit = lambda ctxs, *, seed: None   # type: ignore[attr-defined]
+    return predict
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # negative control — shuffled-label
 # ═══════════════════════════════════════════════════════════════════════════════
 

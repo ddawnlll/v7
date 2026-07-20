@@ -1,0 +1,14 @@
+{
+  "spec_version": "feature-candidate-v0",
+  "status": "CANDIDATE",
+  "description": "Directional momentum + volatility feature surface for Phase 6 hypothesis testing",
+  "feature_names": ["return_5m", "return_15m", "return_1h", "atr_pct"],
+  "feature_dim": 4,
+  "atr_period": 14,
+  "directional": {
+    "momentum_indices": [0, 1, 2],
+    "unsigned_indices": [3],
+    "rule": "momentum features are multiplied by side_sign (+1 LONG, -1 SHORT); ATR is unsigned"
+  },
+  "causality": "all features use only bars at or before decision_ts — future-append invariant"
+}

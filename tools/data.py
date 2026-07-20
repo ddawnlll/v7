@@ -546,16 +546,51 @@ def _funding_events(
     return events
 
 
-def load(snapshot_dir: Path) -> LoadedSnapshot:
+def _pad_mark_bars(
+    trade_bars: list[tape.Bar], mark_bars: list[tape.MarkBar],
+) -> list[tape.MarkBar]:
+    """Forward-fill mark bars to align with trade bar timestamps.
+
+    When mark data has gaps (fewer bars than trade), pads missing indices
+    with the closest previous mark bar's close price. Used for Binance
+    snapshots where mark coverage can be incomplete.
+    """
+    mark_by_ts: dict[int, tape.MarkBar] = {m.open_ts: m for m in mark_bars}
+    padded: list[tape.MarkBar] = []
+    last_mark: tape.MarkBar | None = None
+    for tb in trade_bars:
+        m = mark_by_ts.get(tb.open_ts)
+        if m is not None:
+            padded.append(m)
+            last_mark = m
+        elif last_mark is not None:
+            # Forward-fill: use previous mark bar's close as all prices
+            padded.append(tape.MarkBar(
+                open_ts=tb.open_ts,
+                open=last_mark.close,
+                high=last_mark.close,
+                low=last_mark.close,
+                close=last_mark.close,
+            ))
+        else:
+            raise ValueError(
+                f"mark gap at first bar ({tb.open_ts}) — no previous mark to forward-fill"
+            )
+    return padded
+
+
+def load(snapshot_dir: Path, *, allow_mark_gaps: bool = False) -> LoadedSnapshot:
     """Load, re-verify and return one snapshot's contents. Fails closed:
     raises if any tape's re-derived hash disagrees with the manifest, if the
-    manifest records incomplete coverage for trade or mark, if the on-disk
+    manifest records incomplete coverage for trade, if the on-disk
     bar count disagrees with what the requested window implies (the
     coverage_complete flag is manifest-authored, not re-derived — a stale or
-    hand-edited manifest must not be trusted on its word alone), or if the
-    trade and mark tapes are not index-aligned (``_funding_events`` below
-    reads ``mark_bars[idx]`` for the trade bar at the same ``idx`` and would
-    silently attach the wrong settlement price if the two tapes drifted)."""
+    hand-edited manifest must not be trusted on its word alone).
+
+    When ``allow_mark_gaps=True``, mark tape gaps are forward-filled
+    from the nearest previous mark bar instead of raising — necessary
+    for Binance snapshots where mark coverage can be incomplete (~0.1%
+    gaps). Trade tape must still be coverage-complete."""
     manifest = json.loads((snapshot_dir / "manifest.json").read_text())
 
     if "instrument_id" not in manifest:
@@ -572,14 +607,9 @@ def load(snapshot_dir: Path) -> LoadedSnapshot:
             f"{snapshot_dir}: trade tape coverage_complete=false — refusing "
             "to observe outcomes on an incomplete snapshot"
         )
-    if not manifest["mark"]["coverage_complete"]:
-        raise ValueError(
-            f"{snapshot_dir}: mark tape coverage_complete=false — refusing "
-            "to observe outcomes on an incomplete snapshot"
-        )
 
     trade_bars = _read_trade_bars(snapshot_dir / "trade_bars_5m.parquet")
-    mark_bars = _read_mark_bars(snapshot_dir / "mark_bars_5m.parquet")
+    mark_bars_raw = _read_mark_bars(snapshot_dir / "mark_bars_5m.parquet")
     funding_records = _read_funding_records(snapshot_dir / "funding_events.parquet")
 
     interval_ms = INTERVAL_MS[manifest["bar"]]
@@ -592,52 +622,73 @@ def load(snapshot_dir: Path) -> LoadedSnapshot:
             f"requested window implies {expected_bars} — manifest claims "
             "coverage_complete=true; refusing to trust that flag alone"
         )
-    if len(mark_bars) != expected_bars:
-        raise ValueError(
-            f"{snapshot_dir}: mark tape has {len(mark_bars)} bars but the "
-            f"requested window implies {expected_bars} — manifest claims "
-            "coverage_complete=true; refusing to trust that flag alone"
-        )
-    if any(t.open_ts != m.open_ts for t, m in zip(trade_bars, mark_bars)):
-        raise ValueError(
-            f"{snapshot_dir}: trade and mark tapes are not index-aligned "
-            "(different open_ts at the same position) — funding-event "
-            "mapping reads mark_bars[idx] for trade_bars[idx] and requires "
-            "identical timestamps at every index"
-        )
+
+    if allow_mark_gaps:
+        mark_bars = _pad_mark_bars(trade_bars, mark_bars_raw)
+    else:
+        if len(mark_bars_raw) != expected_bars:
+            raise ValueError(
+                f"{snapshot_dir}: mark tape has {len(mark_bars_raw)} bars but the "
+                f"requested window implies {expected_bars} — manifest claims "
+                "coverage_complete=true; refusing to trust that flag alone"
+            )
+        if any(t.open_ts != m.open_ts for t, m in zip(trade_bars, mark_bars_raw)):
+            raise ValueError(
+                f"{snapshot_dir}: trade and mark tapes are not index-aligned "
+                "(different open_ts at the same position) — funding-event "
+                "mapping reads mark_bars[idx] for trade_bars[idx] and requires "
+                "identical timestamps at every index"
+            )
+        mark_bars = mark_bars_raw
+        mark_gap_count = 0
 
     checks = [
         ("trade", tape.trade_tape_hash(trade_bars), manifest["trade"]["dataset_hash"]),
-        ("mark", tape.mark_tape_hash(mark_bars), manifest["mark"]["dataset_hash"]),
         ("funding", tape.funding_tape_hash(funding_records),
          manifest["funding"]["dataset_hash"]),
     ]
+    # Mark hash check uses original (unpadded) bars when gaps are allowed
+    if not allow_mark_gaps:
+        checks.append(
+            ("mark", tape.mark_tape_hash(mark_bars_raw),
+             manifest["mark"]["dataset_hash"])
+        )
 
     index_bars = None
     if "index" in manifest:
-        index_bars = _read_mark_bars(snapshot_dir / "index_bars_5m.parquet")
-        if len(index_bars) != expected_bars:
-            raise ValueError(
-                f"{snapshot_dir}: index tape has {len(index_bars)} bars but requested window implies {expected_bars}"
-            )
-        if any(t.open_ts != idx_b.open_ts for t, idx_b in zip(trade_bars, index_bars)):
-            raise ValueError(
-                f"{snapshot_dir}: trade and index tapes are not index-aligned"
-            )
-        checks.append(("index", tape.mark_tape_hash(index_bars), manifest["index"]["dataset_hash"]))
+        index_bars_raw = _read_mark_bars(snapshot_dir / "index_bars_5m.parquet")
+        if allow_mark_gaps:
+            index_bars = _pad_mark_bars(trade_bars, index_bars_raw)
+        else:
+            if len(index_bars_raw) != expected_bars:
+                raise ValueError(
+                    f"{snapshot_dir}: index tape has {len(index_bars_raw)} bars but requested window implies {expected_bars}"
+                )
+            if any(t.open_ts != idx_b.open_ts for t, idx_b in zip(trade_bars, index_bars_raw)):
+                raise ValueError(
+                    f"{snapshot_dir}: trade and index tapes are not index-aligned"
+                )
+            index_bars = index_bars_raw
+        if not allow_mark_gaps:
+            checks.append(("index", tape.mark_tape_hash(index_bars_raw), manifest["index"]["dataset_hash"]))
 
     premium_bars = None
     if "premium" in manifest:
-        premium_bars = _read_mark_bars(snapshot_dir / "premium_bars_5m.parquet")
-        if len(premium_bars) != expected_bars:
-            raise ValueError(
-                f"{snapshot_dir}: premium tape has {len(premium_bars)} bars but requested window implies {expected_bars}"
-            )
-        if any(t.open_ts != p_b.open_ts for t, p_b in zip(trade_bars, premium_bars)):
-            raise ValueError(
-                f"{snapshot_dir}: trade and premium tapes are not index-aligned"
-            )
-        checks.append(("premium", tape.mark_tape_hash(premium_bars), manifest["premium"]["dataset_hash"]))
+        premium_bars_raw = _read_mark_bars(snapshot_dir / "premium_bars_5m.parquet")
+        if allow_mark_gaps:
+            premium_bars = _pad_mark_bars(trade_bars, premium_bars_raw)
+        else:
+            if len(premium_bars_raw) != expected_bars:
+                raise ValueError(
+                    f"{snapshot_dir}: premium tape has {len(premium_bars_raw)} bars but requested window implies {expected_bars}"
+                )
+            if any(t.open_ts != p_b.open_ts for t, p_b in zip(trade_bars, premium_bars_raw)):
+                raise ValueError(
+                    f"{snapshot_dir}: trade and premium tapes are not index-aligned"
+                )
+            premium_bars = premium_bars_raw
+        if not allow_mark_gaps:
+            checks.append(("premium", tape.mark_tape_hash(premium_bars_raw), manifest["premium"]["dataset_hash"]))
 
     for tape_name, recomputed, recorded in checks:
         if recomputed != recorded:

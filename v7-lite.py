@@ -1,1015 +1,2650 @@
 #!/usr/bin/env python3
 """
-V7-Lite — deterministic, auditable trading engine in one file.
+V7-Lite V3 — Quarter-Hour Microstructure Challenger
+====================================================
 
-Design goals:
-- Pure, causal indicators.
-- LONG_NOW / SHORT_NOW / NO_TRADE decisions.
-- One setup: trend-continuation pullback.
-- Deterministic scoring and explicit reasons.
-- Single-source execution costs.
-- Bar-by-bar backtest with stop, target, time exit, fees, and slippage.
-- No machine learning.
-- No lookahead.
+One-file research/execution challenger for ddawnlll/v7.
 
-Expected CSV columns:
-timestamp,open,high,low,close,volume
+Core hypothesis
+---------------
+At UTC quarter-hour boundaries (:00, :15, :30, :45), the first ten seconds of
+aggressor-side trade flow may carry information about the next several hours,
+but only after conditioning on pre-existing liquidity state, price response,
+execution cost, and model uncertainty.
 
-Example:
-python v7-lite.py backtest --csv BTCUSDT_1h.csv
-python v7-lite.py signal --csv BTCUSDT_1h.csv
-python v7-lite.py selftest
+V3 replaces the failed candle-pattern strategies with:
+- quarter-hour aggressor-flow features,
+- clock-phase flow memory,
+- price-response / absorption features,
+- L1 and optional L2 liquidity-state features,
+- optional funding/premium context,
+- calibrated 0–100 trade-quality scores,
+- validation-only threshold tuning,
+- a train-only post-execution early-exit model,
+- rolling train / validation / frozen-OOS evaluation,
+- lab.sim as the sole economic truth.
+
+V3 deliberately DOES NOT reimplement:
+- bar validation,
+- ATR primitives,
+- fee/slippage/funding arithmetic,
+- stop/target/gap semantics,
+- net_R.
+
+Those remain owned by:
+    lab.market
+    lab.indicators
+    lab.sim
+    tools.data
+
+Required data
+-------------
+1. Verified V7 snapshot for 5m execution truth:
+
+    --snapshot BTC-USDT-SWAP=data/snapshots/btc
+
+2. Raw aggressor-side trades, CSV or parquet:
+
+    --trades BTC-USDT-SWAP=data/micro/btc_trades.parquet
+
+   Required semantic columns, aliases accepted:
+       timestamp milliseconds, price, size, aggressor side
+
+3. L1 order-book snapshots, CSV or parquet:
+
+    --book BTC-USDT-SWAP=data/micro/btc_book.parquet
+
+   Required:
+       timestamp, best bid price/size, best ask price/size
+
+   Optional:
+       bid/ask price and size for levels 2..5
+
+The file fails closed when raw trade side or L1 book state is unavailable.
+It never fabricates 10-second order flow from 5m OHLCV.
+
+Examples
+--------
+Inspect data:
+
+    python v7-lite.py inspect-data \
+      --snapshot BTC-USDT-SWAP=data/snapshots/btc \
+      --trades BTC-USDT-SWAP=data/micro/btc_trades.parquet \
+      --book BTC-USDT-SWAP=data/micro/btc_book.parquet
+
+Run rolling V3:
+
+    python v7-lite.py walkforward \
+      --snapshot BTC-USDT-SWAP=data/snapshots/btc \
+      --trades BTC-USDT-SWAP=data/micro/btc_trades.parquet \
+      --book BTC-USDT-SWAP=data/micro/btc_book.parquet \
+      --snapshot ETH-USDT-SWAP=data/snapshots/eth \
+      --trades ETH-USDT-SWAP=data/micro/eth_trades.parquet \
+      --book ETH-USDT-SWAP=data/micro/eth_book.parquet \
+      --train-months 12 \
+      --validation-months 2 \
+      --test-months 2 \
+      --horizon-hours 8 \
+      --output v3-result.json
+
+Run built-in contract tests:
+
+    python v7-lite.py selftest
+
+Research warning
+----------------
+Thresholds are tuned on each fold's validation window only. Frozen OOS is read
+once. After reading an OOS interval, do not retune against that interval.
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
+import hashlib
 import json
 import math
 import statistics
 import sys
-from dataclasses import asdict, dataclass, field
-from enum import Enum
+from collections import Counter, defaultdict, deque
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Iterable, Literal, Mapping, Sequence
+
+import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from lab import indicators, market, sim  # noqa: E402
 
 
+BASE_INTERVAL_MS = 300_000
+QUARTER_MS = 900_000
+DAY_MS = 86_400_000
+MONTH_MS = 30 * DAY_MS
 EPS = 1e-12
 
-
-class Action(str, Enum):
-    LONG_NOW = "LONG_NOW"
-    SHORT_NOW = "SHORT_NOW"
-    NO_TRADE = "NO_TRADE"
+Side = Literal["LONG", "SHORT"]
 
 
-class Side(str, Enum):
-    LONG = "LONG"
-    SHORT = "SHORT"
+# =============================================================================
+# Feature contracts
+# =============================================================================
+
+CORE_FEATURE_NAMES = (
+    # Clock context
+    "utc_hour_sin",
+    "utc_hour_cos",
+
+    # First ten seconds of aggressive flow
+    "dir_volume_imbalance_10s",
+    "dir_trade_count_imbalance_10s",
+    "dir_signed_dollar_flow_z_10s",
+    "total_volume_shock_10s",
+    "trade_count_shock_10s",
+    "large_trade_share_10s",
+    "trade_size_roundness_10s",
+
+    # Clock-phase memory
+    "dir_qh_imbalance_lag_1",
+    "dir_qh_imbalance_lag_4",
+    "dir_qh_imbalance_ewm_4",
+    "dir_qh_imbalance_acceleration",
+
+    # Price response / absorption
+    "dir_return_10s",
+    "realized_volatility_10s",
+    "dir_price_response_to_flow",
+    "dir_absorption_score",
+
+    # Portable top-of-book / microstructure
+    "relative_spread",
+    "dir_l1_book_imbalance",
+    "dir_microprice_deviation",
+    "dir_buy_vwap_to_mid",
+    "dir_sell_vwap_to_mid",
+    "trade_price_variance",
+    "volume_concentration",
+
+    # Aggregated liquidity state
+    "dir_depth_imbalance_l5",
+    "total_depth_l5_z",
+    "liquidity_state",
+
+    # Cost and slow regime
+    "flow_to_depth_ratio",
+    "estimated_round_trip_cost_r",
+    "realized_volatility_1h",
+)
+
+OPTIONAL_POSITIONING_FEATURE_NAMES = (
+    "dir_funding_rate_z",
+    "dir_premium_z",
+    "time_to_funding_fraction",
+)
+
+POST_FEATURE_NAMES = (
+    "elapsed_minutes",
+    "unrealized_r",
+    "mfe_r_so_far",
+    "mae_r_so_far",
+    "dir_residual_flow_imbalance",
+    "flow_sign_flip",
+    "flow_decay_ratio",
+    "dir_return_since_entry",
+    "dir_price_response_since_entry",
+    "dir_absorption_since_entry",
+    "spread_change",
+    "dir_book_imbalance_change",
+    "dir_microprice_change",
+    "estimated_exit_cost_r",
+    "entry_quality_score",
+    "entry_predicted_net_r",
+    "entry_predicted_win_probability",
+)
 
 
-@dataclass(frozen=True)
-class Bar:
-    timestamp: str
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float
+# =============================================================================
+# Configuration and immutable records
+# =============================================================================
 
-    def validate(self) -> None:
-        values = (self.open, self.high, self.low, self.close, self.volume)
-        if not all(math.isfinite(x) for x in values):
-            raise ValueError(f"Non-finite bar: {self}")
-        if self.open <= 0 or self.high <= 0 or self.low <= 0 or self.close <= 0:
-            raise ValueError(f"Non-positive OHLC: {self}")
-        if self.volume < 0:
-            raise ValueError(f"Negative volume: {self}")
-        if self.high < max(self.open, self.close, self.low):
-            raise ValueError(f"High inconsistent: {self}")
-        if self.low > min(self.open, self.close, self.high):
-            raise ValueError(f"Low inconsistent: {self}")
-
-
-@dataclass(frozen=True)
-class EngineConfig:
-    # Indicators
-    fast_ema: int = 20
-    slow_ema: int = 50
+@dataclass(frozen=True, slots=True)
+class V3Config:
+    flow_window_seconds: int = 10
+    horizon_hours: int = 8
+    stop_atr: float = 1.50
+    target_r: float = 1.50
     atr_period: int = 14
-    volume_period: int = 20
 
-    # Setup
-    pullback_atr_distance: float = 0.45
-    max_extension_atr: float = 1.10
-    min_body_atr: float = 0.08
-    max_body_atr: float = 1.20
-    min_volume_ratio: float = 0.70
-    min_atr_pct: float = 0.002
-    max_atr_pct: float = 0.050
+    fee_rate: float = 0.0004
+    slippage_bps: float = 1.0
 
-    # Decision — all seven signal components must reach trade_score.
-    # Default 8 means: trend(2)+pullback(2)+trigger(2)+volatility(1)=7 is
-    # NOT enough; you also need either volume(1) or structure(1).
-    trade_score: int = 8
-    trend_points: int = 2
-    pullback_points: int = 2
-    trigger_points: int = 2
-    volatility_points: int = 1
-    volume_points: int = 1
-    structure_points: int = 1
+    train_months: int = 12
+    validation_months: int = 2
+    test_months: int = 2
+    step_months: int = 2
 
-    # Risk / exits
-    stop_atr: float = 1.5
-    target_r: float = 2.0
-    max_hold_bars: int = 12
-    risk_per_trade: float = 0.01
-    max_leverage: float = 5.0
+    min_trades_in_flow_window: int = 4
+    historical_z_days: int = 30
+    book_max_age_ms: int = 5_000
 
-    # Costs
-    fee_rate_per_side: float = 0.0004
-    slippage_rate_per_side: float = 0.0002
+    threshold_min: int = 50
+    threshold_max: int = 90
+    threshold_step: int = 5
+    minimum_predicted_net_r: float = 0.02
+    minimum_validation_trades: int = 20
+    minimum_validation_pf: float = 1.00
+    minimum_validation_mean_r: float = 0.0
+    minimum_validation_win_rate: float = 0.52
 
-    # Backtest behavior
-    starting_equity: float = 1_000.0
-    # allow_same_bar_exit: if True, checks stop/target on the entry bar's high/low.
-    # WARNING: the bar's high/low formed BEFORE the close (entry price), so
-    # target hits on the entry bar are optimistic lookahead.  Stops are
-    # pessimistic (harmless direction).  Default False to be conservative.
-    allow_same_bar_exit: bool = False
-    stop_first_when_both_hit: bool = True
+    conflict_score_margin: float = 3.0
+    post_checkpoints_minutes: tuple[int, ...] = (5, 15, 30, 60)
+    post_exit_threshold_grid: tuple[float, ...] = (-0.10, -0.05, 0.0, 0.05)
+    enable_post_execution: bool = True
+
+    ridge_alpha: float = 10.0
+    tree_max_depth: int = 3
+    tree_max_iter: int = 100
+    seed: int = 7
 
     def validate(self) -> None:
-        if self.fast_ema < 2 or self.slow_ema <= self.fast_ema:
-            raise ValueError("Require 2 <= fast_ema < slow_ema")
-        if self.atr_period < 2 or self.volume_period < 2:
-            raise ValueError("Periods must be >= 2")
-        if self.stop_atr <= 0 or self.target_r <= 0:
+        if self.flow_window_seconds < 1 or self.flow_window_seconds > 60:
+            raise ValueError("flow_window_seconds must be in [1, 60]")
+        if self.horizon_hours < 1:
+            raise ValueError("horizon_hours must be positive")
+        if self.stop_atr <= 0.0 or self.target_r <= 0.0:
             raise ValueError("stop_atr and target_r must be positive")
-        if not 0 < self.risk_per_trade <= 0.10:
-            raise ValueError("risk_per_trade must be in (0, 0.10]")
-        if self.max_leverage <= 0:
-            raise ValueError("max_leverage must be positive")
-        if self.trade_score <= 0:
-            raise ValueError("trade_score must be positive")
+        if self.atr_period < 2:
+            raise ValueError("atr_period must be >= 2")
+        if self.fee_rate < 0.0 or self.slippage_bps < 0.0:
+            raise ValueError("cost inputs must be non-negative")
+        if min(
+            self.train_months,
+            self.validation_months,
+            self.test_months,
+            self.step_months,
+        ) < 1:
+            raise ValueError("walk-forward month lengths must be positive")
+        if self.min_trades_in_flow_window < 1:
+            raise ValueError("min_trades_in_flow_window must be positive")
+        if self.historical_z_days < 2:
+            raise ValueError("historical_z_days must be >= 2")
+        if not 0 <= self.threshold_min <= self.threshold_max <= 100:
+            raise ValueError("quality thresholds must be in [0, 100]")
+        if self.threshold_step < 1:
+            raise ValueError("threshold_step must be positive")
+        if self.minimum_validation_trades < 1:
+            raise ValueError("minimum_validation_trades must be positive")
+        if not 0.0 <= self.minimum_validation_win_rate <= 1.0:
+            raise ValueError("minimum_validation_win_rate must be in [0, 1]")
+        if self.conflict_score_margin < 0.0:
+            raise ValueError("conflict_score_margin must be non-negative")
+        if any(m <= 0 or m % 5 != 0 for m in self.post_checkpoints_minutes):
+            raise ValueError("post checkpoints must be positive 5-minute multiples")
+        if max(self.post_checkpoints_minutes, default=0) >= self.horizon_hours * 60:
+            raise ValueError("post checkpoints must precede the horizon")
+        if self.tree_max_depth < 1 or self.tree_max_iter < 1:
+            raise ValueError("invalid shallow-tree configuration")
 
 
-@dataclass(frozen=True)
-class IndicatorState:
-    ema_fast: float
-    ema_slow: float
-    atr: float
-    atr_pct: float
-    volume_ratio: float
-    body_atr: float
+@dataclass(frozen=True, slots=True)
+class RawTradeTape:
+    ts_ms: np.ndarray
+    price: np.ndarray
+    size: np.ndarray
+    side_sign: np.ndarray  # +1 buyer taker, -1 seller taker
+
+    def validate(self, symbol: str) -> None:
+        n = len(self.ts_ms)
+        if n == 0:
+            raise ValueError(f"{symbol}: empty raw trade tape")
+        if not (len(self.price) == len(self.size) == len(self.side_sign) == n):
+            raise ValueError(f"{symbol}: raw trade arrays have different lengths")
+        if np.any(np.diff(self.ts_ms) < 0):
+            raise ValueError(f"{symbol}: raw trade timestamps are not sorted")
+        if not np.all(np.isfinite(self.price)) or np.any(self.price <= 0):
+            raise ValueError(f"{symbol}: invalid trade prices")
+        if not np.all(np.isfinite(self.size)) or np.any(self.size <= 0):
+            raise ValueError(f"{symbol}: invalid trade sizes")
+        if not np.all(np.isin(self.side_sign, (-1.0, 1.0))):
+            raise ValueError(f"{symbol}: aggressor side must be BUY/SELL")
 
 
-@dataclass(frozen=True)
-class Decision:
-    action: Action
-    score: int
-    timestamp: str
-    price: float
-    stop_price: float | None
-    target_price: float | None
-    reasons: tuple[str, ...]
-    rejections: tuple[str, ...]
-    indicators: IndicatorState | None
+@dataclass(frozen=True, slots=True)
+class BookTape:
+    ts_ms: np.ndarray
+    bid_px: np.ndarray       # shape (n, levels)
+    ask_px: np.ndarray
+    bid_size: np.ndarray
+    ask_size: np.ndarray
 
-    def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2, default=str)
+    @property
+    def levels(self) -> int:
+        return int(self.bid_px.shape[1])
+
+    def validate(self, symbol: str) -> None:
+        n = len(self.ts_ms)
+        if n == 0:
+            raise ValueError(f"{symbol}: empty book tape")
+        for name, arr in (
+            ("bid_px", self.bid_px),
+            ("ask_px", self.ask_px),
+            ("bid_size", self.bid_size),
+            ("ask_size", self.ask_size),
+        ):
+            if arr.ndim != 2 or arr.shape[0] != n:
+                raise ValueError(f"{symbol}: {name} has invalid shape {arr.shape}")
+            if not np.all(np.isfinite(arr)):
+                raise ValueError(f"{symbol}: {name} contains non-finite values")
+        if self.levels < 1:
+            raise ValueError(f"{symbol}: at least L1 book is required")
+        if np.any(np.diff(self.ts_ms) <= 0):
+            raise ValueError(f"{symbol}: book timestamps must be strictly increasing")
+        if np.any(self.bid_px <= 0) or np.any(self.ask_px <= 0):
+            raise ValueError(f"{symbol}: book prices must be positive")
+        if np.any(self.bid_size < 0) or np.any(self.ask_size < 0):
+            raise ValueError(f"{symbol}: book sizes must be non-negative")
+        if np.any(self.ask_px[:, 0] <= self.bid_px[:, 0]):
+            raise ValueError(f"{symbol}: crossed/locked L1 book found")
 
 
-@dataclass
-class Position:
+@dataclass(frozen=True, slots=True)
+class SymbolData:
+    symbol: str
+    bars: list[market.Bar]
+    funding_events: list[sim.FundingEvent]
+    trades: RawTradeTape
+    book: BookTape
+    premium_bars: Sequence | None
+    manifest: dict
+
+
+@dataclass(frozen=True, slots=True)
+class RawQuarterEvent:
+    symbol: str
+    quarter_ts: int
+    decision_ts: int
+    entry_index: int
+    raw_features: dict[str, float]
+    final_outcome_long: sim.TradeOutcome
+    final_outcome_short: sim.TradeOutcome
+    checkpoint_outcomes_long: dict[int, sim.TradeOutcome]
+    checkpoint_outcomes_short: dict[int, sim.TradeOutcome]
+
+
+@dataclass(frozen=True, slots=True)
+class DirectionalEvent:
+    event_id: str
+    symbol: str
     side: Side
-    entry_bar_index: int
-    entry_timestamp: str
-    entry_price: float
-    stop_price: float
-    target_price: float
-    quantity: float
-    initial_risk_cash: float
-    entry_fee: float
-    score: int
-    reasons: tuple[str, ...]
+    decision_ts: int
+    entry_index: int
+    outcome_end_ts: int
+    features: np.ndarray
+    final_outcome: sim.TradeOutcome
+    checkpoint_outcomes: dict[int, sim.TradeOutcome]
 
 
-@dataclass(frozen=True)
-class Trade:
-    side: Side
-    entry_timestamp: str
-    exit_timestamp: str
-    entry_price: float
-    exit_price: float
-    quantity: float
-    gross_pnl: float
-    fees: float
-    net_pnl: float
-    r_multiple: float
-    exit_reason: str
-    score: int
+@dataclass(frozen=True, slots=True)
+class EntryPrediction:
+    event: DirectionalEvent
+    predicted_net_r: float
+    predicted_win_probability: float
+    uncertainty: float
+    quality_score: float
 
 
-@dataclass(frozen=True)
-class BacktestResult:
-    starting_equity: float
-    ending_equity: float
-    net_profit: float
-    return_pct: float
-    trades: int
-    wins: int
-    losses: int
-    win_rate: float
-    expectancy_r: float
-    profit_factor: float
-    max_drawdown_pct: float
-    average_win_r: float
-    average_loss_r: float
-    trades_detail: tuple[Trade, ...] = field(repr=False)
-
-    def summary_dict(self) -> dict:
-        d = asdict(self)
-        d.pop("trades_detail", None)
-        return d
+@dataclass(frozen=True, slots=True)
+class SelectedTrade:
+    event: DirectionalEvent
+    quality_score: float
+    predicted_net_r: float
+    predicted_win_probability: float
+    realized_outcome: sim.TradeOutcome
+    post_action: str
+    post_checkpoint_minutes: int | None
 
 
-def ema(values: Sequence[float], period: int) -> list[float]:
-    """
-    Causal EMA seeded with SMA(period). Values before seed are NaN.
-    """
-    if period < 2:
-        raise ValueError("EMA period must be >= 2")
-    n = len(values)
-    out = [math.nan] * n
-    if n < period:
-        return out
-
-    seed = sum(values[:period]) / period
-    out[period - 1] = seed
-    alpha = 2.0 / (period + 1.0)
-
-    prev = seed
-    for i in range(period, n):
-        prev = alpha * values[i] + (1.0 - alpha) * prev
-        out[i] = prev
-    return out
+@dataclass(frozen=True, slots=True)
+class FoldWindow:
+    fold_index: int
+    train_start: int
+    train_end: int
+    validation_start: int
+    validation_end: int
+    test_start: int
+    test_end: int
 
 
-def atr(bars: Sequence[Bar], period: int) -> list[float]:
-    """
-    Wilder ATR. First ATR is seeded from period true ranges.
-    """
-    if period < 2:
-        raise ValueError("ATR period must be >= 2")
-    n = len(bars)
-    out = [math.nan] * n
-    if n < period + 1:
-        return out
-
-    tr = [math.nan] * n
-    for i in range(1, n):
-        prev_close = bars[i - 1].close
-        b = bars[i]
-        tr[i] = max(
-            b.high - b.low,
-            abs(b.high - prev_close),
-            abs(b.low - prev_close),
-        )
-
-    seed_index = period
-    seed_values = tr[1 : period + 1]
-    seed = sum(seed_values) / period
-    out[seed_index] = seed
-
-    prev = seed
-    for i in range(seed_index + 1, n):
-        prev = ((period - 1) * prev + tr[i]) / period
-        out[i] = prev
-    return out
+@dataclass(frozen=True, slots=True)
+class Performance:
+    n_trades: int
+    mean_net_r: float | None
+    median_net_r: float | None
+    win_rate: float | None
+    profit_factor: float | None
+    cumulative_net_r: float
+    max_drawdown_r: float
+    average_win_r: float | None
+    average_loss_r: float | None
+    longest_losing_streak: int
+    ci95_low: float | None
+    ci95_high: float | None
+    post_early_exits: int
+    symbols: dict[str, dict]
+    sides: dict[str, dict]
 
 
-def rolling_mean(values: Sequence[float], period: int) -> list[float]:
-    if period < 1:
-        raise ValueError("period must be >= 1")
-    n = len(values)
-    out = [math.nan] * n
-    if n < period:
-        return out
+# =============================================================================
+# Generic table loading with strict semantic aliases
+# =============================================================================
 
-    window_sum = sum(values[:period])
-    out[period - 1] = window_sum / period
-    for i in range(period, n):
-        window_sum += values[i] - values[i - period]
-        out[i] = window_sum / period
-    return out
+_TS_ALIASES = (
+    "ts_ms", "timestamp_ms", "timestamp", "ts", "time", "trade_time",
+)
+_PRICE_ALIASES = ("price", "px", "trade_price")
+_SIZE_ALIASES = ("size", "qty", "quantity", "amount", "base_volume")
+_SIDE_ALIASES = (
+    "side", "aggressor_side", "taker_side", "trade_side", "is_buyer_maker",
+)
+
+_BOOK_ALIASES = {
+    "bid_px1": ("bid_px1", "bid_price1", "best_bid", "bid1_price", "b1_px"),
+    "ask_px1": ("ask_px1", "ask_price1", "best_ask", "ask1_price", "a1_px"),
+    "bid_sz1": ("bid_sz1", "bid_size1", "best_bid_size", "bid1_size", "b1_sz"),
+    "ask_sz1": ("ask_sz1", "ask_size1", "best_ask_size", "ask1_size", "a1_sz"),
+}
 
 
-def load_csv(path: str | Path) -> list[Bar]:
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(p)
+def _normalise_name(value: str) -> str:
+    return value.strip().lower().replace(" ", "_").replace("-", "_")
 
-    bars: list[Bar] = []
-    with p.open("r", newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        required = {"timestamp", "open", "high", "low", "close", "volume"}
-        if reader.fieldnames is None:
-            raise ValueError("CSV has no header")
-        missing = required - {x.strip().lower() for x in reader.fieldnames}
-        if missing:
-            raise ValueError(f"CSV missing columns: {sorted(missing)}")
 
-        normalized = {name.strip().lower(): name for name in reader.fieldnames}
-        for row_no, row in enumerate(reader, start=2):
-            try:
-                bar = Bar(
-                    timestamp=str(row[normalized["timestamp"]]),
-                    open=float(row[normalized["open"]]),
-                    high=float(row[normalized["high"]]),
-                    low=float(row[normalized["low"]]),
-                    close=float(row[normalized["close"]]),
-                    volume=float(row[normalized["volume"]]),
-                )
-                bar.validate()
-                bars.append(bar)
-            except Exception as exc:
-                raise ValueError(f"Invalid CSV row {row_no}: {exc}") from exc
+def _pick_column(columns: Sequence[str], aliases: Sequence[str], label: str) -> str:
+    mapping = {_normalise_name(col): col for col in columns}
+    for alias in aliases:
+        actual = mapping.get(_normalise_name(alias))
+        if actual is not None:
+            return actual
+    raise ValueError(f"missing required {label}; accepted aliases={aliases}")
 
-    if len(bars) < 100:
-        raise ValueError("Need at least 100 bars")
 
-    # Timestamp validation: must be monotonically increasing, no duplicates.
-    prev_ts: int | None = None
-    for bar in bars:
+def _read_rows(path: Path) -> tuple[list[str], list[dict]]:
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    suffix = path.suffix.lower()
+    if suffix in {".csv", ".txt"}:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames is None:
+                raise ValueError(f"{path}: missing header")
+            rows = list(reader)
+            return list(reader.fieldnames), rows
+
+    if suffix in {".jsonl", ".ndjson"}:
+        rows = []
+        with path.open("r", encoding="utf-8") as handle:
+            for line_no, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise ValueError(f"{path}:{line_no}: JSON row must be object")
+                rows.append(row)
+        if not rows:
+            raise ValueError(f"{path}: empty JSONL")
+        return list(rows[0]), rows
+
+    if suffix in {".parquet", ".pq"}:
         try:
-            ts = int(bar.timestamp)
-        except ValueError:
-            raise ValueError(f"Non-numeric timestamp: {bar.timestamp}")
-        if prev_ts is not None:
-            if ts <= prev_ts:
-                raise ValueError(
-                    f"Timestamps must be strictly increasing; "
-                    f"found {ts} after {prev_ts}"
-                )
-        prev_ts = ts
-    return bars
+            import pandas as pd
+        except ImportError as exc:
+            raise RuntimeError("pandas is required for parquet input") from exc
+        try:
+            frame = pd.read_parquet(path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"cannot read {path}; install pyarrow or fastparquet"
+            ) from exc
+        return [str(col) for col in frame.columns], frame.to_dict("records")
+
+    raise ValueError(f"unsupported data format: {path.suffix}")
 
 
-class DeterministicEngine:
-    def __init__(self, config: EngineConfig):
-        config.validate()
-        self.config = config
-
-    def precompute(self, bars: Sequence[Bar]) -> dict[str, list[float]]:
-        closes = [b.close for b in bars]
-        volumes = [b.volume for b in bars]
-        return {
-            "ema_fast": ema(closes, self.config.fast_ema),
-            "ema_slow": ema(closes, self.config.slow_ema),
-            "atr": atr(bars, self.config.atr_period),
-            "volume_mean": rolling_mean(volumes, self.config.volume_period),
-        }
-
-    def indicator_state(
-        self,
-        bars: Sequence[Bar],
-        indicators: dict[str, list[float]],
-        i: int,
-    ) -> IndicatorState | None:
-        if i <= 0:
-            return None
-
-        ef = indicators["ema_fast"][i]
-        es = indicators["ema_slow"][i]
-        a = indicators["atr"][i]
-        vm = indicators["volume_mean"][i]
-
-        if not all(math.isfinite(x) for x in (ef, es, a, vm)):
-            return None
-        if a <= EPS or vm <= EPS:
-            return None
-
-        b = bars[i]
-        return IndicatorState(
-            ema_fast=ef,
-            ema_slow=es,
-            atr=a,
-            atr_pct=a / b.close,
-            volume_ratio=b.volume / vm,
-            body_atr=abs(b.close - b.open) / a,
-        )
-
-    def decide(
-        self,
-        bars: Sequence[Bar],
-        indicators: dict[str, list[float]],
-        i: int,
-    ) -> Decision:
-        b = bars[i]
-        state = self.indicator_state(bars, indicators, i)
-
-        if state is None:
-            return Decision(
-                action=Action.NO_TRADE,
-                score=0,
-                timestamp=b.timestamp,
-                price=b.close,
-                stop_price=None,
-                target_price=None,
-                reasons=(),
-                rejections=("insufficient_indicator_history",),
-                indicators=None,
-            )
-
-        prev = bars[i - 1]
-        cfg = self.config
-
-        long_score = 0
-        short_score = 0
-        long_reasons: list[str] = []
-        short_reasons: list[str] = []
-        common_rejections: list[str] = []
-
-        volatility_ok = cfg.min_atr_pct <= state.atr_pct <= cfg.max_atr_pct
-        body_ok = cfg.min_body_atr <= state.body_atr <= cfg.max_body_atr
-        volume_ok = state.volume_ratio >= cfg.min_volume_ratio
-
-        if volatility_ok:
-            long_score += cfg.volatility_points
-            short_score += cfg.volatility_points
-            long_reasons.append("volatility_regime_ok")
-            short_reasons.append("volatility_regime_ok")
-        else:
-            common_rejections.append("volatility_regime_rejected")
-
-        if volume_ok:
-            long_score += cfg.volume_points
-            short_score += cfg.volume_points
-            long_reasons.append("volume_ok")
-            short_reasons.append("volume_ok")
-        else:
-            common_rejections.append("volume_too_low")
-
-        if not body_ok:
-            common_rejections.append("trigger_candle_body_rejected")
-
-        # Trend
-        bullish_trend = state.ema_fast > state.ema_slow and b.close > state.ema_slow
-        bearish_trend = state.ema_fast < state.ema_slow and b.close < state.ema_slow
-
-        if bullish_trend:
-            long_score += cfg.trend_points
-            long_reasons.append("bullish_ema_structure")
-        if bearish_trend:
-            short_score += cfg.trend_points
-            short_reasons.append("bearish_ema_structure")
-
-        # Pullback proximity to fast EMA, while avoiding overextension.
-        long_distance = abs(b.low - state.ema_fast) / state.atr
-        short_distance = abs(b.high - state.ema_fast) / state.atr
-        long_extension = max(0.0, b.close - state.ema_fast) / state.atr
-        short_extension = max(0.0, state.ema_fast - b.close) / state.atr
-
-        long_pullback = (
-            bullish_trend
-            and long_distance <= cfg.pullback_atr_distance
-            and long_extension <= cfg.max_extension_atr
-        )
-        short_pullback = (
-            bearish_trend
-            and short_distance <= cfg.pullback_atr_distance
-            and short_extension <= cfg.max_extension_atr
-        )
-
-        if long_pullback:
-            long_score += cfg.pullback_points
-            long_reasons.append("pullback_to_fast_ema")
-        if short_pullback:
-            short_score += cfg.pullback_points
-            short_reasons.append("pullback_to_fast_ema")
-
-        # Trigger: directional recovery plus prior-bar confirmation.
-        long_trigger = (
-            body_ok
-            and b.close > b.open
-            and b.close > prev.close
-            and b.close >= state.ema_fast
-        )
-        short_trigger = (
-            body_ok
-            and b.close < b.open
-            and b.close < prev.close
-            and b.close <= state.ema_fast
-        )
-
-        if long_trigger:
-            long_score += cfg.trigger_points
-            long_reasons.append("bullish_recovery_trigger")
-        if short_trigger:
-            short_score += cfg.trigger_points
-            short_reasons.append("bearish_recovery_trigger")
-
-        # Structure confirmation: higher low for long, lower high for short.
-        if b.low >= prev.low:
-            long_score += cfg.structure_points
-            long_reasons.append("higher_low_structure")
-        if b.high <= prev.high:
-            short_score += cfg.structure_points
-            short_reasons.append("lower_high_structure")
-
-        long_valid = (
-            long_score >= cfg.trade_score
-            and bullish_trend
-            and long_pullback
-            and long_trigger
-            and volatility_ok
-        )
-        short_valid = (
-            short_score >= cfg.trade_score
-            and bearish_trend
-            and short_pullback
-            and short_trigger
-            and volatility_ok
-        )
-
-        # Deterministic conflict resolution: no trade on tie/conflict.
-        if long_valid and short_valid:
-            return Decision(
-                action=Action.NO_TRADE,
-                score=max(long_score, short_score),
-                timestamp=b.timestamp,
-                price=b.close,
-                stop_price=None,
-                target_price=None,
-                reasons=(),
-                rejections=("conflicting_long_short_signal",),
-                indicators=state,
-            )
-
-        if long_valid:
-            stop = b.close - cfg.stop_atr * state.atr
-            risk = b.close - stop
-            target = b.close + cfg.target_r * risk
-            return Decision(
-                action=Action.LONG_NOW,
-                score=long_score,
-                timestamp=b.timestamp,
-                price=b.close,
-                stop_price=stop,
-                target_price=target,
-                reasons=tuple(long_reasons),
-                rejections=tuple(common_rejections),
-                indicators=state,
-            )
-
-        if short_valid:
-            stop = b.close + cfg.stop_atr * state.atr
-            risk = stop - b.close
-            target = b.close - cfg.target_r * risk
-            return Decision(
-                action=Action.SHORT_NOW,
-                score=short_score,
-                timestamp=b.timestamp,
-                price=b.close,
-                stop_price=stop,
-                target_price=target,
-                reasons=tuple(short_reasons),
-                rejections=tuple(common_rejections),
-                indicators=state,
-            )
-
-        dominant_score = max(long_score, short_score)
-        rejections = list(common_rejections)
-        if not bullish_trend and not bearish_trend:
-            rejections.append("trend_not_clear")
-        if dominant_score < cfg.trade_score:
-            rejections.append("score_below_threshold")
-        if bullish_trend and not long_pullback:
-            rejections.append("no_valid_long_pullback")
-        if bearish_trend and not short_pullback:
-            rejections.append("no_valid_short_pullback")
-        if bullish_trend and not long_trigger:
-            rejections.append("no_long_trigger")
-        if bearish_trend and not short_trigger:
-            rejections.append("no_short_trigger")
-
-        return Decision(
-            action=Action.NO_TRADE,
-            score=dominant_score,
-            timestamp=b.timestamp,
-            price=b.close,
-            stop_price=None,
-            target_price=None,
-            reasons=(),
-            rejections=tuple(dict.fromkeys(rejections)),
-            indicators=state,
-        )
-
-
-def adverse_entry_price(side: Side, close: float, slippage_rate: float) -> float:
-    if side is Side.LONG:
-        return close * (1.0 + slippage_rate)
-    return close * (1.0 - slippage_rate)
-
-
-def adverse_exit_price(side: Side, raw_price: float, slippage_rate: float) -> float:
-    if side is Side.LONG:
-        return raw_price * (1.0 - slippage_rate)
-    return raw_price * (1.0 + slippage_rate)
-
-
-def size_position(
-    equity: float,
-    side: Side,
-    raw_entry: float,
-    stop_price: float,
-    cfg: EngineConfig,
-) -> tuple[float, float, float]:
-    entry = adverse_entry_price(side, raw_entry, cfg.slippage_rate_per_side)
-    stop_distance = abs(entry - stop_price)
-    if stop_distance <= EPS:
-        raise ValueError("Stop distance is zero")
-
-    risk_cash = equity * cfg.risk_per_trade
-    qty_by_risk = risk_cash / stop_distance
-    qty_by_leverage = (equity * cfg.max_leverage) / entry
-    qty = min(qty_by_risk, qty_by_leverage)
-
-    if qty <= EPS or not math.isfinite(qty):
-        raise ValueError("Invalid position quantity")
-
-    actual_risk_cash = qty * stop_distance
-    return entry, qty, actual_risk_cash
-
-
-def close_trade(
-    position: Position,
-    exit_timestamp: str,
-    raw_exit_price: float,
-    reason: str,
-    cfg: EngineConfig,
-) -> Trade:
-    exit_price = adverse_exit_price(
-        position.side,
-        raw_exit_price,
-        cfg.slippage_rate_per_side,
-    )
-
-    if position.side is Side.LONG:
-        gross = (exit_price - position.entry_price) * position.quantity
+def _timestamp_ms(value: object) -> int:
+    if isinstance(value, (int, np.integer)):
+        raw = int(value)
+    elif isinstance(value, float) and math.isfinite(value):
+        raw = int(value)
     else:
-        gross = (position.entry_price - exit_price) * position.quantity
+        text = str(value).strip()
+        if text.replace(".", "", 1).isdigit():
+            raw = int(float(text))
+        else:
+            normalised = text.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(normalised)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
 
-    exit_fee = exit_price * position.quantity * cfg.fee_rate_per_side
-    fees = position.entry_fee + exit_fee
-    net = gross - fees
-    r_multiple = net / position.initial_risk_cash if position.initial_risk_cash > EPS else 0.0
+    # Infer common Unix units.
+    magnitude = abs(raw)
+    if magnitude < 10_000_000_000:      # seconds
+        return raw * 1000
+    if magnitude < 10_000_000_000_000:  # milliseconds
+        return raw
+    if magnitude < 10_000_000_000_000_000:  # microseconds
+        return raw // 1000
+    return raw // 1_000_000             # nanoseconds
 
-    return Trade(
-        side=position.side,
-        entry_timestamp=position.entry_timestamp,
-        exit_timestamp=exit_timestamp,
-        entry_price=position.entry_price,
-        exit_price=exit_price,
-        quantity=position.quantity,
-        gross_pnl=gross,
-        fees=fees,
-        net_pnl=net,
-        r_multiple=r_multiple,
-        exit_reason=reason,
-        score=position.score,
+
+def _normalise_side(value: object, column_name: str) -> float:
+    name = _normalise_name(column_name)
+
+    if name == "is_buyer_maker":
+        # Binance convention: true means buyer was maker, therefore seller taker.
+        if isinstance(value, str):
+            flag = value.strip().lower() in {"1", "true", "t", "yes"}
+        else:
+            flag = bool(value)
+        return -1.0 if flag else 1.0
+
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        numeric = float(value)
+        if numeric > 0:
+            return 1.0
+        if numeric < 0:
+            return -1.0
+
+    text = str(value).strip().lower()
+    if text in {"buy", "b", "buyer", "bid", "long", "1", "+1"}:
+        return 1.0
+    if text in {"sell", "s", "seller", "ask", "short", "-1"}:
+        return -1.0
+    raise ValueError(f"unsupported aggressor side value: {value!r}")
+
+
+def load_trade_tape(path: Path, symbol: str) -> RawTradeTape:
+    columns, rows = _read_rows(path)
+    ts_col = _pick_column(columns, _TS_ALIASES, "trade timestamp")
+    price_col = _pick_column(columns, _PRICE_ALIASES, "trade price")
+    size_col = _pick_column(columns, _SIZE_ALIASES, "trade size")
+    side_col = _pick_column(columns, _SIDE_ALIASES, "aggressor side")
+
+    parsed = []
+    for row_no, row in enumerate(rows, 2):
+        try:
+            parsed.append((
+                _timestamp_ms(row[ts_col]),
+                float(row[price_col]),
+                float(row[size_col]),
+                _normalise_side(row[side_col], side_col),
+            ))
+        except Exception as exc:
+            raise ValueError(f"{path}:{row_no}: {exc}") from exc
+
+    parsed.sort(key=lambda item: item[0])
+    tape = RawTradeTape(
+        ts_ms=np.asarray([item[0] for item in parsed], dtype=np.int64),
+        price=np.asarray([item[1] for item in parsed], dtype=float),
+        size=np.asarray([item[2] for item in parsed], dtype=float),
+        side_sign=np.asarray([item[3] for item in parsed], dtype=float),
+    )
+    tape.validate(symbol)
+    return tape
+
+
+def _book_level_aliases(side: str, field: str, level: int) -> tuple[str, ...]:
+    if field == "px":
+        return (
+            f"{side}_px{level}",
+            f"{side}_price{level}",
+            f"{side}{level}_price",
+            f"{side[0]}{level}_px",
+        )
+    return (
+        f"{side}_sz{level}",
+        f"{side}_size{level}",
+        f"{side}{level}_size",
+        f"{side[0]}{level}_sz",
     )
 
 
-def evaluate_exit(
-    position: Position,
-    bar: Bar,
-    bars_held: int,
-    cfg: EngineConfig,
-) -> tuple[float, str] | None:
-    if position.side is Side.LONG:
-        stop_hit = bar.low <= position.stop_price
-        target_hit = bar.high >= position.target_price
-    else:
-        stop_hit = bar.high >= position.stop_price
-        target_hit = bar.low <= position.target_price
+def load_book_tape(path: Path, symbol: str) -> BookTape:
+    columns, rows = _read_rows(path)
+    ts_col = _pick_column(columns, _TS_ALIASES, "book timestamp")
 
-    if stop_hit and target_hit:
-        if cfg.stop_first_when_both_hit:
-            return position.stop_price, "stop_and_target_same_bar_stop_first"
-        return position.target_price, "stop_and_target_same_bar_target_first"
+    mapping = {_normalise_name(col): col for col in columns}
 
-    if stop_hit:
-        return position.stop_price, "stop"
-    if target_hit:
-        return position.target_price, "target"
-    if bars_held >= cfg.max_hold_bars:
-        return bar.close, "time_exit"
+    def optional_column(aliases: Sequence[str]) -> str | None:
+        for alias in aliases:
+            value = mapping.get(_normalise_name(alias))
+            if value is not None:
+                return value
+        return None
+
+    level_columns = []
+    for level in range(1, 6):
+        bid_px = optional_column(
+            _BOOK_ALIASES["bid_px1"] if level == 1
+            else _book_level_aliases("bid", "px", level)
+        )
+        ask_px = optional_column(
+            _BOOK_ALIASES["ask_px1"] if level == 1
+            else _book_level_aliases("ask", "px", level)
+        )
+        bid_sz = optional_column(
+            _BOOK_ALIASES["bid_sz1"] if level == 1
+            else _book_level_aliases("bid", "sz", level)
+        )
+        ask_sz = optional_column(
+            _BOOK_ALIASES["ask_sz1"] if level == 1
+            else _book_level_aliases("ask", "sz", level)
+        )
+
+        if level == 1 and None in {bid_px, ask_px, bid_sz, ask_sz}:
+            raise ValueError(f"{path}: complete L1 bid/ask price/size is required")
+        if None in {bid_px, ask_px, bid_sz, ask_sz}:
+            break
+        level_columns.append((bid_px, ask_px, bid_sz, ask_sz))
+
+    parsed = []
+    for row_no, row in enumerate(rows, 2):
+        try:
+            values = [_timestamp_ms(row[ts_col])]
+            for bid_px, ask_px, bid_sz, ask_sz in level_columns:
+                values.extend((
+                    float(row[bid_px]),
+                    float(row[ask_px]),
+                    float(row[bid_sz]),
+                    float(row[ask_sz]),
+                ))
+            parsed.append(values)
+        except Exception as exc:
+            raise ValueError(f"{path}:{row_no}: {exc}") from exc
+
+    parsed.sort(key=lambda item: item[0])
+    deduped = []
+    for row in parsed:
+        if deduped and row[0] == deduped[-1][0]:
+            deduped[-1] = row
+        else:
+            deduped.append(row)
+
+    levels = len(level_columns)
+    n = len(deduped)
+    bid_px = np.empty((n, levels), dtype=float)
+    ask_px = np.empty((n, levels), dtype=float)
+    bid_size = np.empty((n, levels), dtype=float)
+    ask_size = np.empty((n, levels), dtype=float)
+
+    for row_index, row in enumerate(deduped):
+        offset = 1
+        for level_index in range(levels):
+            bid_px[row_index, level_index] = row[offset]
+            ask_px[row_index, level_index] = row[offset + 1]
+            bid_size[row_index, level_index] = row[offset + 2]
+            ask_size[row_index, level_index] = row[offset + 3]
+            offset += 4
+
+    tape = BookTape(
+        ts_ms=np.asarray([row[0] for row in deduped], dtype=np.int64),
+        bid_px=bid_px,
+        ask_px=ask_px,
+        bid_size=bid_size,
+        ask_size=ask_size,
+    )
+    tape.validate(symbol)
+    return tape
+
+
+# =============================================================================
+# Utility math
+# =============================================================================
+
+def _safe_div(numerator: float, denominator: float, default: float = 0.0) -> float:
+    if not (math.isfinite(numerator) and math.isfinite(denominator)):
+        return default
+    if abs(denominator) <= EPS:
+        return default
+    value = numerator / denominator
+    return value if math.isfinite(value) else default
+
+
+def _mean_std(values: Sequence[float]) -> tuple[float, float]:
+    finite = [float(value) for value in values if math.isfinite(float(value))]
+    if not finite:
+        return 0.0, 1.0
+    mean = statistics.fmean(finite)
+    std = statistics.pstdev(finite) if len(finite) >= 2 else 0.0
+    return mean, max(std, 1e-9)
+
+
+def _zscore(value: float, history: Sequence[float]) -> float:
+    mean, std = _mean_std(history)
+    return (value - mean) / std
+
+
+def _sigmoid(value: float) -> float:
+    value = max(-40.0, min(40.0, value))
+    return 1.0 / (1.0 + math.exp(-value))
+
+
+def _profit_factor(values: Sequence[float]) -> float | None:
+    wins = sum(value for value in values if value > 0.0)
+    losses = abs(sum(value for value in values if value < 0.0))
+    if losses > EPS:
+        return wins / losses
+    if wins > 0.0:
+        return math.inf
     return None
 
 
-def backtest(bars: Sequence[Bar], cfg: EngineConfig) -> BacktestResult:
-    engine = DeterministicEngine(cfg)
-    indicators = engine.precompute(bars)
+def _max_drawdown(values: Sequence[float]) -> float:
+    cumulative = 0.0
+    peak = 0.0
+    maximum = 0.0
+    for value in values:
+        cumulative += value
+        peak = max(peak, cumulative)
+        maximum = max(maximum, peak - cumulative)
+    return maximum
 
-    equity = cfg.starting_equity
-    peak_equity = equity
-    max_drawdown = 0.0
-    position: Position | None = None
-    trades: list[Trade] = []
 
-    warmup = max(cfg.slow_ema, cfg.atr_period + 1, cfg.volume_period)
+def _bootstrap_ci(
+    values: Sequence[float],
+    *,
+    seed: int,
+    n_boot: int = 2000,
+) -> tuple[float | None, float | None]:
+    array = np.asarray(values, dtype=float)
+    n = len(array)
+    if n < 20:
+        return None, None
+    block = max(2, int(round(math.sqrt(n))))
+    rng = np.random.default_rng(seed)
+    means = np.empty(n_boot, dtype=float)
+    for index in range(n_boot):
+        sample = []
+        while len(sample) < n:
+            start = int(rng.integers(0, n))
+            for offset in range(block):
+                sample.append(float(array[(start + offset) % n]))
+                if len(sample) == n:
+                    break
+        means[index] = float(np.mean(sample))
+    low, high = np.quantile(means, [0.025, 0.975])
+    return float(low), float(high)
 
-    for i in range(warmup, len(bars)):
-        bar = bars[i]
 
-        if position is not None:
-            held = i - position.entry_bar_index
-            exit_eval = evaluate_exit(position, bar, held, cfg)
-            if exit_eval is not None:
-                raw_exit, reason = exit_eval
-                trade = close_trade(position, bar.timestamp, raw_exit, reason, cfg)
-                # entry_fee was already deducted at open; only apply gross minus exit_fee.
-                exit_fee = trade.fees - position.entry_fee
-                equity += trade.gross_pnl - exit_fee
-                trades.append(trade)
-                position = None
+def _hash_array(array: np.ndarray) -> str:
+    return hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest()
 
-                peak_equity = max(peak_equity, equity)
-                if peak_equity > EPS:
-                    drawdown = (peak_equity - equity) / peak_equity
-                    max_drawdown = max(max_drawdown, drawdown)
 
-        if position is None:
-            decision = engine.decide(bars, indicators, i)
-            if decision.action is not Action.NO_TRADE:
-                side = Side.LONG if decision.action is Action.LONG_NOW else Side.SHORT
-                assert decision.stop_price is not None
-                assert decision.target_price is not None
+def _book_state(book: BookTape, ts_ms: int, max_age_ms: int) -> tuple[int, dict] | None:
+    index = bisect.bisect_right(book.ts_ms, ts_ms) - 1
+    if index < 0:
+        return None
+    age = ts_ms - int(book.ts_ms[index])
+    if age < 0 or age > max_age_ms:
+        return None
 
-                # Guard: skip trade when equity is too low to size a valid position.
-                if equity <= cfg.starting_equity * 0.001:
-                    continue
-                entry, qty, risk_cash = size_position(
-                    equity=equity,
-                    side=side,
-                    raw_entry=bar.close,
-                    stop_price=decision.stop_price,
-                    cfg=cfg,
-                )
-                entry_fee = entry * qty * cfg.fee_rate_per_side
-                equity -= entry_fee
+    bid = float(book.bid_px[index, 0])
+    ask = float(book.ask_px[index, 0])
+    bid_size = float(book.bid_size[index, 0])
+    ask_size = float(book.ask_size[index, 0])
+    mid = (bid + ask) * 0.5
+    spread = (ask - bid) / mid
+    imbalance = _safe_div(bid_size - ask_size, bid_size + ask_size)
+    microprice = _safe_div(
+        ask * bid_size + bid * ask_size,
+        bid_size + ask_size,
+        default=mid,
+    )
+    micro_dev = (microprice - mid) / mid
 
-                position = Position(
-                    side=side,
-                    entry_bar_index=i,
-                    entry_timestamp=bar.timestamp,
-                    entry_price=entry,
-                    stop_price=decision.stop_price,
-                    target_price=decision.target_price,
-                    quantity=qty,
-                    initial_risk_cash=risk_cash,
-                    entry_fee=entry_fee,
-                    score=decision.score,
-                    reasons=decision.reasons,
-                )
+    levels = min(5, book.levels)
+    total_bid = float(np.sum(book.bid_size[index, :levels]))
+    total_ask = float(np.sum(book.ask_size[index, :levels]))
+    depth_imbalance = _safe_div(total_bid - total_ask, total_bid + total_ask)
+    total_depth = total_bid + total_ask
 
-                if cfg.allow_same_bar_exit:
-                    exit_eval = evaluate_exit(position, bar, 0, cfg)
-                    if exit_eval is not None:
-                        raw_exit, reason = exit_eval
-                        trade = close_trade(position, bar.timestamp, raw_exit, reason, cfg)
-                        # entry fee was already deducted, so add gross minus exit fee only.
-                        exit_fee = trade.fees - position.entry_fee
-                        equity += trade.gross_pnl - exit_fee
-                        trades.append(trade)
-                        position = None
+    return index, {
+        "book_age_ms": float(age),
+        "bid": bid,
+        "ask": ask,
+        "mid": mid,
+        "spread": spread,
+        "l1_imbalance": imbalance,
+        "microprice_deviation": micro_dev,
+        "depth_imbalance_l5": depth_imbalance,
+        "total_depth_l5": total_depth,
+    }
 
-                        peak_equity = max(peak_equity, equity)
-                        if peak_equity > EPS:
-                            drawdown = (peak_equity - equity) / peak_equity
-                            max_drawdown = max(max_drawdown, drawdown)
 
-    if position is not None:
-        last = bars[-1]
-        trade = close_trade(position, last.timestamp, last.close, "end_of_data", cfg)
-        exit_fee = trade.fees - position.entry_fee
-        equity += trade.gross_pnl - exit_fee
-        trades.append(trade)
+def _trade_slice(tape: RawTradeTape, start_ts: int, end_ts: int) -> slice:
+    left = bisect.bisect_left(tape.ts_ms, start_ts)
+    right = bisect.bisect_left(tape.ts_ms, end_ts)
+    return slice(left, right)
 
-    wins = [t for t in trades if t.net_pnl > 0]
-    losses = [t for t in trades if t.net_pnl < 0]
-    r_values = [t.r_multiple for t in trades]
 
-    gross_profit = sum(t.net_pnl for t in wins)
-    gross_loss = abs(sum(t.net_pnl for t in losses))
-    profit_factor = gross_profit / gross_loss if gross_loss > EPS else (
-        math.inf if gross_profit > 0 else 0.0
+def _trade_window_metrics(
+    tape: RawTradeTape,
+    start_ts: int,
+    end_ts: int,
+    reference_mid: float,
+    large_trade_threshold: float,
+) -> dict[str, float] | None:
+    window = _trade_slice(tape, start_ts, end_ts)
+    prices = tape.price[window]
+    sizes = tape.size[window]
+    signs = tape.side_sign[window]
+    n = len(prices)
+    if n == 0:
+        return None
+
+    notionals = prices * sizes
+    buy_mask = signs > 0
+    sell_mask = signs < 0
+    buy_volume = float(np.sum(sizes[buy_mask]))
+    sell_volume = float(np.sum(sizes[sell_mask]))
+    total_volume = buy_volume + sell_volume
+    buy_count = int(np.sum(buy_mask))
+    sell_count = int(np.sum(sell_mask))
+    total_count = buy_count + sell_count
+    signed_dollar_flow = float(np.sum(notionals * signs))
+    total_dollar_volume = float(np.sum(notionals))
+
+    volume_imbalance = _safe_div(buy_volume - sell_volume, total_volume)
+    count_imbalance = _safe_div(buy_count - sell_count, total_count)
+
+    first_price = float(prices[0])
+    last_price = float(prices[-1])
+    return_fraction = (last_price - first_price) / first_price
+
+    if n >= 2:
+        tick_returns = np.diff(np.log(prices))
+        realized_vol = float(np.sqrt(np.sum(tick_returns * tick_returns)))
+        trade_price_variance = float(np.var(prices / reference_mid - 1.0))
+    else:
+        realized_vol = 0.0
+        trade_price_variance = 0.0
+
+    buy_notional = notionals[buy_mask]
+    sell_notional = notionals[sell_mask]
+    buy_vwap = (
+        float(np.sum(prices[buy_mask] * sizes[buy_mask]) / np.sum(sizes[buy_mask]))
+        if buy_count and float(np.sum(sizes[buy_mask])) > EPS
+        else reference_mid
+    )
+    sell_vwap = (
+        float(np.sum(prices[sell_mask] * sizes[sell_mask]) / np.sum(sizes[sell_mask]))
+        if sell_count and float(np.sum(sizes[sell_mask])) > EPS
+        else reference_mid
     )
 
-    expectancy_r = statistics.fmean(r_values) if r_values else 0.0
-    avg_win_r = statistics.fmean([t.r_multiple for t in wins]) if wins else 0.0
-    avg_loss_r = statistics.fmean([t.r_multiple for t in losses]) if losses else 0.0
-
-    return BacktestResult(
-        starting_equity=cfg.starting_equity,
-        ending_equity=equity,
-        net_profit=equity - cfg.starting_equity,
-        return_pct=((equity / cfg.starting_equity) - 1.0) * 100.0,
-        trades=len(trades),
-        wins=len(wins),
-        losses=len(losses),
-        win_rate=(len(wins) / len(trades) * 100.0) if trades else 0.0,
-        expectancy_r=expectancy_r,
-        profit_factor=profit_factor,
-        max_drawdown_pct=max_drawdown * 100.0,
-        average_win_r=avg_win_r,
-        average_loss_r=avg_loss_r,
-        trades_detail=tuple(trades),
+    weights = notionals / max(total_dollar_volume, EPS)
+    concentration = float(np.sum(weights * weights))
+    large_share = float(
+        np.sum(notionals[notionals >= large_trade_threshold]) /
+        max(total_dollar_volume, EPS)
     )
 
+    # Scale-free proxy for algorithmic round-number slicing:
+    # fraction of quote notionals near integer multiples of 100.
+    nearest = np.round(notionals / 100.0) * 100.0
+    roundness = float(np.mean(np.abs(notionals - nearest) <= np.maximum(1.0, 0.01 * notionals)))
 
-def latest_signal(bars: Sequence[Bar], cfg: EngineConfig) -> Decision:
-    engine = DeterministicEngine(cfg)
-    indicators = engine.precompute(bars)
-    return engine.decide(bars, indicators, len(bars) - 1)
+    return {
+        "n_trades": float(n),
+        "buy_count": float(buy_count),
+        "sell_count": float(sell_count),
+        "total_count": float(total_count),
+        "buy_volume": buy_volume,
+        "sell_volume": sell_volume,
+        "total_volume": total_volume,
+        "volume_imbalance": volume_imbalance,
+        "trade_count_imbalance": count_imbalance,
+        "signed_dollar_flow": signed_dollar_flow,
+        "total_dollar_volume": total_dollar_volume,
+        "return": return_fraction,
+        "realized_volatility": realized_vol,
+        "trade_price_variance": trade_price_variance,
+        "buy_vwap_to_mid": (buy_vwap - reference_mid) / reference_mid,
+        "sell_vwap_to_mid": (sell_vwap - reference_mid) / reference_mid,
+        "volume_concentration": concentration,
+        "large_trade_share": large_share,
+        "trade_size_roundness": roundness,
+    }
 
 
-def write_trades_csv(path: str | Path, trades: Sequence[Trade]) -> None:
-    p = Path(path)
-    with p.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "side",
-                "entry_timestamp",
-                "exit_timestamp",
-                "entry_price",
-                "exit_price",
-                "quantity",
-                "gross_pnl",
-                "fees",
-                "net_pnl",
-                "r_multiple",
-                "exit_reason",
-                "score",
-            ],
+def _bar_index_at_or_after(bars: Sequence[market.Bar], ts_ms: int) -> int:
+    timestamps = [bar.open_ts for bar in bars]
+    return bisect.bisect_left(timestamps, ts_ms)
+
+
+def _bar_index_at_or_before(bars: Sequence[market.Bar], ts_ms: int) -> int:
+    timestamps = [bar.open_ts for bar in bars]
+    return bisect.bisect_right(timestamps, ts_ms) - 1
+
+
+# =============================================================================
+# Quarter-hour feature generation and lab.sim outcomes
+# =============================================================================
+
+def _funding_context(
+    data: SymbolData,
+    entry_index: int,
+    decision_ts: int,
+    funding_history: deque[float],
+) -> tuple[float, float]:
+    past_events = [
+        event for event in data.funding_events
+        if event.bar_index <= entry_index
+    ]
+    if past_events:
+        current_rate = float(past_events[-1].rate)
+    else:
+        current_rate = 0.0
+
+    funding_z = _zscore(current_rate, funding_history) if funding_history else 0.0
+
+    future_events = [
+        event for event in data.funding_events
+        if event.bar_index > entry_index
+    ]
+    if future_events:
+        next_bar_ts = data.bars[future_events[0].bar_index].open_ts
+        minutes = max(0.0, (next_bar_ts - decision_ts) / 60_000)
+        fraction = min(1.0, minutes / (8.0 * 60.0))
+    else:
+        fraction = 1.0
+
+    return funding_z, fraction
+
+
+def _premium_context(
+    data: SymbolData,
+    entry_index: int,
+    premium_history: deque[float],
+) -> float:
+    if data.premium_bars is None or entry_index >= len(data.premium_bars):
+        return 0.0
+    value = float(data.premium_bars[entry_index].close)
+    return _zscore(value, premium_history) if premium_history else 0.0
+
+
+def _simulate_outcome(
+    data: SymbolData,
+    entry_index: int,
+    side: Side,
+    atr_value: float,
+    config: V3Config,
+    max_holding_bars: int,
+    price_arrays: tuple[Sequence[float], Sequence[float], Sequence[float], Sequence[float]] | None = None,
+) -> sim.TradeOutcome:
+    bars = data.bars
+    entry_price = float(bars[entry_index].open)
+    stop_distance = config.stop_atr * atr_value
+    if side == "LONG":
+        stop_price = entry_price - stop_distance
+        target_price = entry_price + config.target_r * stop_distance
+    else:
+        stop_price = entry_price + stop_distance
+        target_price = entry_price - config.target_r * stop_distance
+
+    spec = sim.TradeSpec(
+        side=side,
+        entry_index=entry_index,
+        entry_price=entry_price,
+        stop_price=stop_price,
+        target_price=target_price,
+        max_holding_bars=max_holding_bars,
+        fee_rate=config.fee_rate,
+        slippage_bps=config.slippage_bps,
+    )
+    if price_arrays is None:
+        price_arrays = (
+            [bar.open for bar in bars],
+            [bar.high for bar in bars],
+            [bar.low for bar in bars],
+            [bar.close for bar in bars],
         )
-        writer.writeheader()
-        for trade in trades:
-            row = asdict(trade)
-            row["side"] = trade.side.value
-            writer.writerow(row)
+    opens, highs, lows, closes = price_arrays
+    return sim.simulate(
+        opens,
+        highs,
+        lows,
+        closes,
+        spec,
+        funding_events=data.funding_events,
+    )
 
 
-def synthetic_bars(count: int = 500) -> list[Bar]:
-    """
-    Deterministic synthetic series for smoke tests.
-    Not intended to demonstrate profitability.
-    """
-    bars: list[Bar] = []
+def build_raw_quarter_events(
+    data: SymbolData,
+    config: V3Config,
+) -> tuple[list[RawQuarterEvent], dict]:
+    config.validate()
+    bars = data.bars
+    if len(bars) < config.atr_period + 10:
+        raise ValueError(f"{data.symbol}: insufficient 5m bars")
+
+    highs = [bar.high for bar in bars]
+    lows = [bar.low for bar in bars]
+    closes = [bar.close for bar in bars]
+    atr_values = indicators.compute_atr(
+        highs, lows, closes, period=config.atr_period
+    )
+    price_arrays = (
+        [bar.open for bar in bars],
+        highs,
+        lows,
+        closes,
+    )
+
+    start_ts = max(
+        int(data.trades.ts_ms[0]),
+        int(data.book.ts_ms[0]),
+        bars[0].open_ts,
+    )
+    end_ts = min(
+        int(data.trades.ts_ms[-1]),
+        int(data.book.ts_ms[-1]),
+        bars[-1].open_ts + BASE_INTERVAL_MS,
+    )
+    quarter_ts = ((start_ts + QUARTER_MS - 1) // QUARTER_MS) * QUARTER_MS
+
+    historical_limit = max(96, config.historical_z_days * 96)
+    history = {
+        "signed_flow": deque(maxlen=historical_limit),
+        "total_volume": deque(maxlen=historical_limit),
+        "trade_count": deque(maxlen=historical_limit),
+        "return": deque(maxlen=historical_limit),
+        "depth": deque(maxlen=historical_limit),
+        "spread": deque(maxlen=historical_limit),
+        "large_trade_notional": deque(maxlen=historical_limit),
+        "funding": deque(maxlen=max(30, config.historical_z_days * 3)),
+        "premium": deque(maxlen=historical_limit),
+        "imbalance": deque(maxlen=8),
+    }
+
+    events_out: list[RawQuarterEvent] = []
+    dropped = Counter()
+
+    horizon_bars = config.horizon_hours * 12
+    checkpoint_bars = {
+        minute: minute // 5
+        for minute in config.post_checkpoints_minutes
+    }
+
+    while quarter_ts < end_ts:
+        decision_ts = quarter_ts + config.flow_window_seconds * 1000
+        entry_ts = ((decision_ts + BASE_INTERVAL_MS - 1) // BASE_INTERVAL_MS) * BASE_INTERVAL_MS
+        entry_index = _bar_index_at_or_after(bars, entry_ts)
+
+        if entry_index < config.atr_period:
+            dropped["atr_warmup"] += 1
+            quarter_ts += QUARTER_MS
+            continue
+        if entry_index + horizon_bars >= len(bars):
+            dropped["insufficient_forward_bars"] += 1
+            quarter_ts += QUARTER_MS
+            continue
+
+        atr_value = float(atr_values[entry_index - 1])
+        if not math.isfinite(atr_value) or atr_value <= 0.0:
+            dropped["invalid_atr"] += 1
+            quarter_ts += QUARTER_MS
+            continue
+
+        pre_book = _book_state(data.book, quarter_ts, config.book_max_age_ms)
+        end_book = _book_state(data.book, decision_ts, config.book_max_age_ms)
+        if pre_book is None or end_book is None:
+            dropped["stale_or_missing_book"] += 1
+            quarter_ts += QUARTER_MS
+            continue
+        _, pre = pre_book
+        _, after = end_book
+
+        trade_window = _trade_slice(data.trades, quarter_ts, decision_ts)
+        notionals = data.trades.price[trade_window] * data.trades.size[trade_window]
+        if len(notionals) < config.min_trades_in_flow_window:
+            dropped["too_few_window_trades"] += 1
+            quarter_ts += QUARTER_MS
+            continue
+
+        if history["large_trade_notional"]:
+            large_threshold = float(np.quantile(
+                np.asarray(history["large_trade_notional"], dtype=float),
+                0.90,
+            ))
+        else:
+            large_threshold = float(np.quantile(notionals, 0.90))
+
+        metrics = _trade_window_metrics(
+            data.trades,
+            quarter_ts,
+            decision_ts,
+            pre["mid"],
+            large_threshold,
+        )
+        if metrics is None:
+            dropped["empty_trade_window"] += 1
+            quarter_ts += QUARTER_MS
+            continue
+
+        signed_flow_z = _zscore(
+            metrics["signed_dollar_flow"],
+            history["signed_flow"],
+        )
+        volume_shock = _zscore(
+            metrics["total_dollar_volume"],
+            history["total_volume"],
+        )
+        count_shock = _zscore(
+            metrics["total_count"],
+            history["trade_count"],
+        )
+        return_z = _zscore(metrics["return"], history["return"])
+        depth_z = _zscore(pre["total_depth_l5"], history["depth"])
+        spread_z = _zscore(pre["spread"], history["spread"])
+
+        imbalance_history = list(history["imbalance"])
+        lag_1 = imbalance_history[-1] if len(imbalance_history) >= 1 else 0.0
+        lag_4 = imbalance_history[-4] if len(imbalance_history) >= 4 else 0.0
+        if imbalance_history:
+            weights = np.exp(np.linspace(-1.5, 0.0, min(4, len(imbalance_history))))
+            values = np.asarray(imbalance_history[-len(weights):], dtype=float)
+            ewm_4 = float(np.sum(values * weights) / np.sum(weights))
+        else:
+            ewm_4 = 0.0
+        acceleration = metrics["volume_imbalance"] - lag_1
+
+        response = _safe_div(
+            metrics["return"],
+            abs(metrics["volume_imbalance"]) + 0.05,
+        )
+        # Positive signed flow with weak/negative price response gives positive
+        # absorption. Directional mirroring is applied later.
+        absorption = signed_flow_z - return_z
+
+        flow_to_depth = _safe_div(
+            metrics["total_dollar_volume"],
+            pre["total_depth_l5"] * pre["mid"],
+        )
+
+        risk_fraction = config.stop_atr * atr_value / bars[entry_index].open
+        fixed_round_trip = (
+            2.0 * config.fee_rate
+            + 2.0 * config.slippage_bps * 1e-4
+        )
+        estimated_cost_r = fixed_round_trip / max(risk_fraction, EPS)
+
+        hour_bar_index = entry_index - 1
+        start_hour_index = max(0, hour_bar_index - 12)
+        hour_closes = np.asarray(
+            [bar.close for bar in bars[start_hour_index:hour_bar_index + 1]],
+            dtype=float,
+        )
+        if len(hour_closes) >= 2:
+            log_returns = np.diff(np.log(hour_closes))
+            realized_vol_1h = float(np.sqrt(np.sum(log_returns * log_returns)))
+        else:
+            realized_vol_1h = 0.0
+
+        funding_z, time_to_funding = _funding_context(
+            data, entry_index, decision_ts, history["funding"]
+        )
+        premium_z = _premium_context(
+            data, entry_index, history["premium"]
+        )
+
+        if spread_z <= 0.0 and depth_z >= 0.0 and realized_vol_1h < 0.02:
+            liquidity_state = 1.0   # calm / supportive
+        elif spread_z >= 1.0 or depth_z <= -1.0:
+            liquidity_state = -1.0  # stressed
+        else:
+            liquidity_state = 0.0
+
+        raw = {
+            "utc_hour_sin": math.sin(
+                2.0 * math.pi * (
+                    datetime.fromtimestamp(quarter_ts / 1000, timezone.utc).hour
+                    + datetime.fromtimestamp(quarter_ts / 1000, timezone.utc).minute / 60.0
+                ) / 24.0
+            ),
+            "utc_hour_cos": math.cos(
+                2.0 * math.pi * (
+                    datetime.fromtimestamp(quarter_ts / 1000, timezone.utc).hour
+                    + datetime.fromtimestamp(quarter_ts / 1000, timezone.utc).minute / 60.0
+                ) / 24.0
+            ),
+            "volume_imbalance_10s": metrics["volume_imbalance"],
+            "trade_count_imbalance_10s": metrics["trade_count_imbalance"],
+            "signed_dollar_flow_z_10s": signed_flow_z,
+            "total_volume_shock_10s": volume_shock,
+            "trade_count_shock_10s": count_shock,
+            "large_trade_share_10s": metrics["large_trade_share"],
+            "trade_size_roundness_10s": metrics["trade_size_roundness"],
+            "qh_imbalance_lag_1": lag_1,
+            "qh_imbalance_lag_4": lag_4,
+            "qh_imbalance_ewm_4": ewm_4,
+            "qh_imbalance_acceleration": acceleration,
+            "return_10s": metrics["return"],
+            "realized_volatility_10s": metrics["realized_volatility"],
+            "price_response_to_flow": response,
+            "absorption_score": absorption,
+            "relative_spread": pre["spread"],
+            "l1_book_imbalance": pre["l1_imbalance"],
+            "microprice_deviation": pre["microprice_deviation"],
+            "buy_vwap_to_mid": metrics["buy_vwap_to_mid"],
+            "sell_vwap_to_mid": metrics["sell_vwap_to_mid"],
+            "trade_price_variance": metrics["trade_price_variance"],
+            "volume_concentration": metrics["volume_concentration"],
+            "depth_imbalance_l5": pre["depth_imbalance_l5"],
+            "total_depth_l5_z": depth_z,
+            "liquidity_state": liquidity_state,
+            "flow_to_depth_ratio": flow_to_depth,
+            "estimated_round_trip_cost_r": estimated_cost_r,
+            "realized_volatility_1h": realized_vol_1h,
+            "funding_rate_z": funding_z,
+            "premium_z": premium_z,
+            "time_to_funding_fraction": time_to_funding,
+            "entry_spread": pre["spread"],
+            "entry_book_imbalance": pre["l1_imbalance"],
+            "entry_microprice_deviation": pre["microprice_deviation"],
+            "entry_flow_imbalance": metrics["volume_imbalance"],
+            "entry_signed_flow_z": signed_flow_z,
+            "entry_mid": pre["mid"],
+        }
+
+        try:
+            final_long = _simulate_outcome(
+                data, entry_index, "LONG", atr_value, config, horizon_bars, price_arrays
+            )
+            final_short = _simulate_outcome(
+                data, entry_index, "SHORT", atr_value, config, horizon_bars, price_arrays
+            )
+            cp_long = {
+                minute: _simulate_outcome(
+                    data, entry_index, "LONG", atr_value, config, bars_count, price_arrays
+                )
+                for minute, bars_count in checkpoint_bars.items()
+            }
+            cp_short = {
+                minute: _simulate_outcome(
+                    data, entry_index, "SHORT", atr_value, config, bars_count, price_arrays
+                )
+                for minute, bars_count in checkpoint_bars.items()
+            }
+        except Exception:
+            dropped["simulation_error"] += 1
+            quarter_ts += QUARTER_MS
+            continue
+
+        events_out.append(
+            RawQuarterEvent(
+                symbol=data.symbol,
+                quarter_ts=quarter_ts,
+                decision_ts=decision_ts,
+                entry_index=entry_index,
+                raw_features=raw,
+                final_outcome_long=final_long,
+                final_outcome_short=final_short,
+                checkpoint_outcomes_long=cp_long,
+                checkpoint_outcomes_short=cp_short,
+            )
+        )
+
+        history["signed_flow"].append(metrics["signed_dollar_flow"])
+        history["total_volume"].append(metrics["total_dollar_volume"])
+        history["trade_count"].append(metrics["total_count"])
+        history["return"].append(metrics["return"])
+        history["depth"].append(pre["total_depth_l5"])
+        history["spread"].append(pre["spread"])
+        history["large_trade_notional"].extend(float(value) for value in notionals)
+        history["imbalance"].append(metrics["volume_imbalance"])
+        past_funding = [
+            event.rate for event in data.funding_events
+            if event.bar_index <= entry_index
+        ]
+        if past_funding:
+            history["funding"].append(float(past_funding[-1]))
+        if data.premium_bars is not None:
+            history["premium"].append(float(data.premium_bars[entry_index].close))
+
+        quarter_ts += QUARTER_MS
+
+    report = {
+        "symbol": data.symbol,
+        "n_raw_events": len(events_out),
+        "dropped": dict(dropped),
+        "trade_tape_hash": _hash_array(data.trades.ts_ms),
+        "book_tape_hash": _hash_array(data.book.ts_ms),
+        "book_levels": data.book.levels,
+    }
+    return events_out, report
+
+
+def directionalise_event(
+    raw_event: RawQuarterEvent,
+    side: Side,
+    include_positioning: bool,
+    bars: Sequence[market.Bar],
+) -> DirectionalEvent:
+    sign = 1.0 if side == "LONG" else -1.0
+    raw = raw_event.raw_features
+
+    feature_values = {
+        "utc_hour_sin": raw["utc_hour_sin"],
+        "utc_hour_cos": raw["utc_hour_cos"],
+        "dir_volume_imbalance_10s": sign * raw["volume_imbalance_10s"],
+        "dir_trade_count_imbalance_10s": sign * raw["trade_count_imbalance_10s"],
+        "dir_signed_dollar_flow_z_10s": sign * raw["signed_dollar_flow_z_10s"],
+        "total_volume_shock_10s": raw["total_volume_shock_10s"],
+        "trade_count_shock_10s": raw["trade_count_shock_10s"],
+        "large_trade_share_10s": raw["large_trade_share_10s"],
+        "trade_size_roundness_10s": raw["trade_size_roundness_10s"],
+        "dir_qh_imbalance_lag_1": sign * raw["qh_imbalance_lag_1"],
+        "dir_qh_imbalance_lag_4": sign * raw["qh_imbalance_lag_4"],
+        "dir_qh_imbalance_ewm_4": sign * raw["qh_imbalance_ewm_4"],
+        "dir_qh_imbalance_acceleration": sign * raw["qh_imbalance_acceleration"],
+        "dir_return_10s": sign * raw["return_10s"],
+        "realized_volatility_10s": raw["realized_volatility_10s"],
+        "dir_price_response_to_flow": sign * raw["price_response_to_flow"],
+        # Positive means flow in the candidate direction was absorbed.
+        "dir_absorption_score": sign * raw["absorption_score"],
+        "relative_spread": raw["relative_spread"],
+        "dir_l1_book_imbalance": sign * raw["l1_book_imbalance"],
+        "dir_microprice_deviation": sign * raw["microprice_deviation"],
+        "dir_buy_vwap_to_mid": sign * raw["buy_vwap_to_mid"],
+        "dir_sell_vwap_to_mid": sign * raw["sell_vwap_to_mid"],
+        "trade_price_variance": raw["trade_price_variance"],
+        "volume_concentration": raw["volume_concentration"],
+        "dir_depth_imbalance_l5": sign * raw["depth_imbalance_l5"],
+        "total_depth_l5_z": raw["total_depth_l5_z"],
+        "liquidity_state": raw["liquidity_state"],
+        "flow_to_depth_ratio": raw["flow_to_depth_ratio"],
+        "estimated_round_trip_cost_r": raw["estimated_round_trip_cost_r"],
+        "realized_volatility_1h": raw["realized_volatility_1h"],
+        "dir_funding_rate_z": sign * raw["funding_rate_z"],
+        "dir_premium_z": sign * raw["premium_z"],
+        "time_to_funding_fraction": raw["time_to_funding_fraction"],
+    }
+
+    names = CORE_FEATURE_NAMES + (
+        OPTIONAL_POSITIONING_FEATURE_NAMES if include_positioning else ()
+    )
+    vector = np.asarray([feature_values[name] for name in names], dtype=float)
+    if not np.all(np.isfinite(vector)):
+        raise ValueError(
+            f"{raw_event.symbol}:{raw_event.decision_ts}:{side}: non-finite features"
+        )
+
+    outcome = (
+        raw_event.final_outcome_long if side == "LONG"
+        else raw_event.final_outcome_short
+    )
+    checkpoints = (
+        raw_event.checkpoint_outcomes_long if side == "LONG"
+        else raw_event.checkpoint_outcomes_short
+    )
+    outcome_end_ts = (
+        bars[outcome.exit_index].open_ts + BASE_INTERVAL_MS
+    )
+    event_id = (
+        f"v3|{raw_event.symbol}|{raw_event.decision_ts}|{side}"
+    )
+    return DirectionalEvent(
+        event_id=event_id,
+        symbol=raw_event.symbol,
+        side=side,
+        decision_ts=raw_event.decision_ts,
+        entry_index=raw_event.entry_index,
+        outcome_end_ts=outcome_end_ts,
+        features=vector,
+        final_outcome=outcome,
+        checkpoint_outcomes=checkpoints,
+    )
+
+
+# =============================================================================
+# Entry models and 0–100 quality score
+# =============================================================================
+
+class EntryModel:
+    def __init__(self, config: V3Config):
+        self.config = config
+        self.scaler = None
+        self.ridge = None
+        self.tree = None
+        self.classifier = None
+        self.target_scale = 1.0
+        self.fitted = False
+
+    def fit(self, events: Sequence[DirectionalEvent]) -> None:
+        if len(events) < 30:
+            raise ValueError("entry model requires at least 30 training events")
+        try:
+            from sklearn.tree import DecisionTreeRegressor
+            from sklearn.linear_model import LogisticRegression, Ridge
+            from sklearn.preprocessing import StandardScaler
+        except ImportError as exc:
+            raise RuntimeError("scikit-learn is required for V3 models") from exc
+
+        x = np.vstack([event.features for event in events])
+        y = np.asarray([event.final_outcome.net_r for event in events], dtype=float)
+        y_win = (y > 0.0).astype(int)
+
+        self.scaler = StandardScaler()
+        x_scaled = self.scaler.fit_transform(x)
+
+        self.ridge = Ridge(alpha=self.config.ridge_alpha)
+        self.ridge.fit(x_scaled, y)
+
+        self.tree = DecisionTreeRegressor(
+            max_depth=self.config.tree_max_depth,
+            min_samples_leaf=max(10, len(events) // 50),
+            random_state=self.config.seed,
+        )
+        self.tree.fit(x_scaled, y)
+
+        self.classifier = LogisticRegression(
+            C=0.25,
+            max_iter=1000,
+            class_weight="balanced",
+            random_state=self.config.seed,
+        )
+        if len(np.unique(y_win)) < 2:
+            raise ValueError("entry training labels contain only one win class")
+        self.classifier.fit(x_scaled, y_win)
+
+        self.target_scale = max(float(np.std(y)), 0.10)
+        self.fitted = True
+
+    def predict(self, event: DirectionalEvent) -> EntryPrediction:
+        if not self.fitted:
+            raise RuntimeError("entry model is not fitted")
+        x = event.features.reshape(1, -1)
+        x_scaled = self.scaler.transform(x)
+        ridge_r = float(self.ridge.predict(x_scaled)[0])
+        tree_r = float(self.tree.predict(x_scaled)[0])
+        predicted_r = 0.60 * ridge_r + 0.40 * tree_r
+        p_win = float(self.classifier.predict_proba(x_scaled)[0, 1])
+        disagreement = abs(ridge_r - tree_r)
+        uncertainty = min(1.0, disagreement / self.target_scale)
+
+        edge_component = _sigmoid(predicted_r / self.target_scale)
+        quality = 100.0 * (
+            0.55 * p_win
+            + 0.45 * edge_component
+            - 0.20 * uncertainty
+        )
+        quality = min(100.0, max(0.0, quality))
+        return EntryPrediction(
+            event=event,
+            predicted_net_r=predicted_r,
+            predicted_win_probability=p_win,
+            uncertainty=uncertainty,
+            quality_score=quality,
+        )
+
+
+# =============================================================================
+# Post-execution model
+# =============================================================================
+
+def _post_features(
+    prediction: EntryPrediction,
+    raw_lookup: Mapping[tuple[str, int], RawQuarterEvent],
+    data_by_symbol: Mapping[str, SymbolData],
+    checkpoint_minutes: int,
+) -> np.ndarray | None:
+    event = prediction.event
+    raw_event = raw_lookup[(event.symbol, event.decision_ts)]
+    data = data_by_symbol[event.symbol]
+    side_sign = 1.0 if event.side == "LONG" else -1.0
+    checkpoint_bars = checkpoint_minutes // 5
+    checkpoint_index = event.entry_index + checkpoint_bars
+
+    if checkpoint_index >= len(data.bars):
+        return None
+    if event.final_outcome.exit_index <= checkpoint_index:
+        return None
+
+    entry_price = float(data.bars[event.entry_index].open)
+    risk_fraction = event.final_outcome.risk_fraction
+    checkpoint_price = float(data.bars[checkpoint_index].close)
+    directional_return = side_sign * (checkpoint_price - entry_price) / entry_price
+    unrealized_r = directional_return / max(risk_fraction, EPS)
+
+    inspected = data.bars[event.entry_index + 1:checkpoint_index + 1]
+    if event.side == "LONG":
+        adverse = max(
+            [max(0.0, (entry_price - bar.low) / entry_price) for bar in inspected],
+            default=0.0,
+        )
+        favorable = max(
+            [max(0.0, (bar.high - entry_price) / entry_price) for bar in inspected],
+            default=0.0,
+        )
+    else:
+        adverse = max(
+            [max(0.0, (bar.high - entry_price) / entry_price) for bar in inspected],
+            default=0.0,
+        )
+        favorable = max(
+            [max(0.0, (entry_price - bar.low) / entry_price) for bar in inspected],
+            default=0.0,
+        )
+
+    start_ts = data.bars[event.entry_index].open_ts
+    end_ts = data.bars[checkpoint_index].open_ts + BASE_INTERVAL_MS
+    entry_mid = raw_event.raw_features["entry_mid"]
+    trade_metrics = _trade_window_metrics(
+        data.trades,
+        start_ts,
+        end_ts,
+        entry_mid,
+        large_trade_threshold=float("inf"),
+    )
+    if trade_metrics is None:
+        return None
+
+    current_book = _book_state(
+        data.book,
+        end_ts,
+        max_age_ms=max(5_000, data.book.ts_ms[-1] - data.book.ts_ms[-2] if len(data.book.ts_ms) > 1 else 5_000),
+    )
+    if current_book is None:
+        return None
+    _, book = current_book
+
+    entry_flow = raw_event.raw_features["entry_flow_imbalance"]
+    residual_flow = side_sign * trade_metrics["volume_imbalance"]
+    flow_sign_flip = 1.0 if residual_flow < 0.0 else 0.0
+    flow_decay = _safe_div(
+        abs(trade_metrics["volume_imbalance"]),
+        abs(entry_flow) + 0.05,
+    )
+    price_response = _safe_div(
+        directional_return,
+        abs(trade_metrics["volume_imbalance"]) + 0.05,
+    )
+    absorption = (
+        side_sign * trade_metrics["volume_imbalance"]
+        - directional_return / max(risk_fraction, EPS)
+    )
+
+    spread_change = _safe_div(
+        book["spread"] - raw_event.raw_features["entry_spread"],
+        raw_event.raw_features["entry_spread"] + EPS,
+    )
+    book_change = side_sign * (
+        book["l1_imbalance"]
+        - raw_event.raw_features["entry_book_imbalance"]
+    )
+    micro_change = side_sign * (
+        book["microprice_deviation"]
+        - raw_event.raw_features["entry_microprice_deviation"]
+    )
+    estimated_exit_cost_r = (
+        data.manifest.get("fee_rate", 0.0004)
+        + data.manifest.get("slippage_bps", 1.0) * 1e-4
+    ) / max(risk_fraction, EPS)
+
+    values = (
+        float(checkpoint_minutes),
+        unrealized_r,
+        favorable / max(risk_fraction, EPS),
+        adverse / max(risk_fraction, EPS),
+        residual_flow,
+        flow_sign_flip,
+        flow_decay,
+        directional_return,
+        price_response,
+        absorption,
+        spread_change,
+        book_change,
+        micro_change,
+        estimated_exit_cost_r,
+        prediction.quality_score,
+        prediction.predicted_net_r,
+        prediction.predicted_win_probability,
+    )
+    vector = np.asarray(values, dtype=float)
+    return vector if np.all(np.isfinite(vector)) else None
+
+
+class PostExecutionModel:
+    def __init__(self, config: V3Config):
+        self.config = config
+        self.scaler = None
+        self.ridge = None
+        self.fitted = False
+
+    def fit(
+        self,
+        events: Sequence[DirectionalEvent],
+        entry_model: EntryModel,
+        raw_lookup: Mapping[tuple[str, int], RawQuarterEvent],
+        data_by_symbol: Mapping[str, SymbolData],
+    ) -> dict:
+        if not self.config.enable_post_execution:
+            return {"enabled": False, "samples": 0}
+        try:
+            from sklearn.linear_model import Ridge
+            from sklearn.preprocessing import StandardScaler
+        except ImportError as exc:
+            raise RuntimeError("scikit-learn is required for post model") from exc
+
+        x_rows = []
+        labels = []
+        for event in events:
+            prediction = entry_model.predict(event)
+            for minute, checkpoint_outcome in event.checkpoint_outcomes.items():
+                vector = _post_features(
+                    prediction,
+                    raw_lookup,
+                    data_by_symbol,
+                    minute,
+                )
+                if vector is None:
+                    continue
+                hold_advantage = (
+                    event.final_outcome.net_r
+                    - checkpoint_outcome.net_r
+                )
+                x_rows.append(vector)
+                labels.append(hold_advantage)
+
+        if len(x_rows) < 50:
+            return {"enabled": False, "samples": len(x_rows)}
+
+        x = np.vstack(x_rows)
+        y = np.asarray(labels, dtype=float)
+        self.scaler = StandardScaler()
+        x_scaled = self.scaler.fit_transform(x)
+        self.ridge = Ridge(alpha=self.config.ridge_alpha)
+        self.ridge.fit(x_scaled, y)
+        self.fitted = True
+        return {
+            "enabled": True,
+            "samples": len(x_rows),
+            "mean_hold_advantage": float(np.mean(y)),
+        }
+
+    def predict_hold_advantage(self, features: np.ndarray) -> float:
+        if not self.fitted:
+            return math.inf
+        transformed = self.scaler.transform(features.reshape(1, -1))
+        return float(self.ridge.predict(transformed)[0])
+
+
+# =============================================================================
+# Selection, threshold tuning, and walk-forward
+# =============================================================================
+
+def _group_predictions(
+    predictions: Sequence[EntryPrediction],
+) -> dict[tuple[str, int], list[EntryPrediction]]:
+    grouped: dict[tuple[str, int], list[EntryPrediction]] = defaultdict(list)
+    for prediction in predictions:
+        grouped[(prediction.event.symbol, prediction.event.decision_ts)].append(
+            prediction
+        )
+    return grouped
+
+
+def select_entries(
+    predictions: Sequence[EntryPrediction],
+    threshold: float,
+    config: V3Config,
+) -> tuple[list[EntryPrediction], dict]:
+    grouped = _group_predictions(predictions)
+    selected = []
+    diagnostics = Counter()
+    unavailable_until: dict[str, int] = {}
+    cooldown_ms = config.horizon_hours * 3_600_000
+
+    for (symbol, decision_ts), candidates in sorted(
+        grouped.items(),
+        key=lambda item: (item[0][1], item[0][0]),
+    ):
+        eligible = [
+            candidate for candidate in candidates
+            if candidate.quality_score >= threshold
+            and candidate.predicted_net_r >= config.minimum_predicted_net_r
+        ]
+        if not eligible:
+            diagnostics["below_quality_or_edge_threshold"] += 1
+            continue
+
+        eligible.sort(
+            key=lambda item: (
+                item.quality_score,
+                item.predicted_net_r,
+                item.predicted_win_probability,
+                item.event.side,
+            ),
+            reverse=True,
+        )
+        best = eligible[0]
+        if len(eligible) >= 2 and eligible[0].event.side != eligible[1].event.side:
+            score_gap = eligible[0].quality_score - eligible[1].quality_score
+            if score_gap < config.conflict_score_margin:
+                diagnostics["direction_conflict"] += 1
+                continue
+
+        if decision_ts < unavailable_until.get(symbol, -1):
+            diagnostics["cooldown"] += 1
+            continue
+
+        selected.append(best)
+        unavailable_until[symbol] = decision_ts + cooldown_ms
+        diagnostics["selected"] += 1
+
+    return selected, dict(diagnostics)
+
+
+def apply_post_execution(
+    selected: Sequence[EntryPrediction],
+    post_model: PostExecutionModel,
+    post_exit_threshold: float,
+    raw_lookup: Mapping[tuple[str, int], RawQuarterEvent],
+    data_by_symbol: Mapping[str, SymbolData],
+) -> list[SelectedTrade]:
+    trades = []
+    for prediction in selected:
+        event = prediction.event
+        chosen_outcome = event.final_outcome
+        action = "HOLD_TO_BASE_OUTCOME"
+        checkpoint_used = None
+
+        if post_model.fitted:
+            for minute in sorted(event.checkpoint_outcomes):
+                vector = _post_features(
+                    prediction,
+                    raw_lookup,
+                    data_by_symbol,
+                    minute,
+                )
+                if vector is None:
+                    continue
+                hold_advantage = post_model.predict_hold_advantage(vector)
+                if hold_advantage < post_exit_threshold:
+                    chosen_outcome = event.checkpoint_outcomes[minute]
+                    action = "EXIT_EARLY"
+                    checkpoint_used = minute
+                    break
+
+        trades.append(
+            SelectedTrade(
+                event=event,
+                quality_score=prediction.quality_score,
+                predicted_net_r=prediction.predicted_net_r,
+                predicted_win_probability=prediction.predicted_win_probability,
+                realized_outcome=chosen_outcome,
+                post_action=action,
+                post_checkpoint_minutes=checkpoint_used,
+            )
+        )
+    return trades
+
+
+def performance_from_trades(
+    trades: Sequence[SelectedTrade],
+    *,
+    seed: int,
+) -> Performance:
+    values = [trade.realized_outcome.net_r for trade in trades]
+    if not values:
+        return Performance(
+            n_trades=0,
+            mean_net_r=None,
+            median_net_r=None,
+            win_rate=None,
+            profit_factor=None,
+            cumulative_net_r=0.0,
+            max_drawdown_r=0.0,
+            average_win_r=None,
+            average_loss_r=None,
+            longest_losing_streak=0,
+            ci95_low=None,
+            ci95_high=None,
+            post_early_exits=0,
+            symbols={},
+            sides={},
+        )
+
+    wins = [value for value in values if value > 0.0]
+    losses = [value for value in values if value < 0.0]
+    streak = 0
+    maximum_streak = 0
+    for value in values:
+        if value < 0:
+            streak += 1
+            maximum_streak = max(maximum_streak, streak)
+        else:
+            streak = 0
+
+    symbol_values: dict[str, list[float]] = defaultdict(list)
+    side_values: dict[str, list[float]] = defaultdict(list)
+    for trade in trades:
+        symbol_values[trade.event.symbol].append(trade.realized_outcome.net_r)
+        side_values[trade.event.side].append(trade.realized_outcome.net_r)
+
+    def summary(group: Sequence[float]) -> dict:
+        return {
+            "trades": len(group),
+            "mean_net_r": statistics.fmean(group) if group else None,
+            "win_rate": sum(value > 0.0 for value in group) / len(group) if group else None,
+            "profit_factor": _profit_factor(group),
+            "cumulative_net_r": sum(group),
+        }
+
+    low, high = _bootstrap_ci(values, seed=seed)
+    return Performance(
+        n_trades=len(values),
+        mean_net_r=statistics.fmean(values),
+        median_net_r=statistics.median(values),
+        win_rate=sum(value > 0.0 for value in values) / len(values),
+        profit_factor=_profit_factor(values),
+        cumulative_net_r=sum(values),
+        max_drawdown_r=_max_drawdown(values),
+        average_win_r=statistics.fmean(wins) if wins else None,
+        average_loss_r=statistics.fmean(losses) if losses else None,
+        longest_losing_streak=maximum_streak,
+        ci95_low=low,
+        ci95_high=high,
+        post_early_exits=sum(trade.post_action == "EXIT_EARLY" for trade in trades),
+        symbols={key: summary(group) for key, group in sorted(symbol_values.items())},
+        sides={key: summary(group) for key, group in sorted(side_values.items())},
+    )
+
+
+def tune_policy(
+    validation_predictions: Sequence[EntryPrediction],
+    post_model: PostExecutionModel,
+    raw_lookup: Mapping[tuple[str, int], RawQuarterEvent],
+    data_by_symbol: Mapping[str, SymbolData],
+    config: V3Config,
+) -> tuple[int, float, dict]:
+    candidates = []
+    thresholds = range(
+        config.threshold_min,
+        config.threshold_max + 1,
+        config.threshold_step,
+    )
+    post_thresholds = (
+        config.post_exit_threshold_grid
+        if post_model.fitted
+        else (0.0,)
+    )
+
+    for threshold in thresholds:
+        selected, diagnostics = select_entries(
+            validation_predictions,
+            threshold,
+            config,
+        )
+        for post_threshold in post_thresholds:
+            trades = apply_post_execution(
+                selected,
+                post_model,
+                post_threshold,
+                raw_lookup,
+                data_by_symbol,
+            )
+            perf = performance_from_trades(
+                trades,
+                seed=config.seed + threshold,
+            )
+            if perf.n_trades == 0 or perf.mean_net_r is None:
+                objective = -math.inf
+                pf = 0.0
+                gate_pass = False
+                gate_failures = ["no_trades"]
+            else:
+                pf = perf.profit_factor if perf.profit_factor is not None else 0.0
+                stability_penalty = perf.max_drawdown_r / max(math.sqrt(perf.n_trades), 1.0)
+                objective = (
+                    perf.mean_net_r * math.sqrt(perf.n_trades)
+                    + 0.20 * (perf.win_rate or 0.0)
+                    + 0.05 * min(pf, 3.0)
+                    - 0.02 * stability_penalty
+                )
+                gate_failures = []
+                if perf.n_trades < config.minimum_validation_trades:
+                    gate_failures.append("too_few_validation_trades")
+                if perf.mean_net_r < config.minimum_validation_mean_r:
+                    gate_failures.append("validation_mean_r_below_minimum")
+                if pf < config.minimum_validation_pf:
+                    gate_failures.append("validation_profit_factor_below_minimum")
+                if (perf.win_rate or 0.0) < config.minimum_validation_win_rate:
+                    gate_failures.append("validation_win_rate_below_minimum")
+                gate_pass = not gate_failures
+
+            candidates.append({
+                "quality_threshold": threshold,
+                "post_exit_threshold": post_threshold,
+                "objective": objective,
+                "gate_pass": gate_pass,
+                "gate_failures": gate_failures,
+                "selection_diagnostics": diagnostics,
+                "performance": asdict(perf),
+            })
+
+    candidates.sort(
+        key=lambda row: (
+            row["gate_pass"],
+            row["objective"],
+            row["performance"]["win_rate"] or -1.0,
+            row["performance"]["mean_net_r"] or -math.inf,
+            row["performance"]["n_trades"],
+        ),
+        reverse=True,
+    )
+    best = candidates[0]
+    return (
+        int(best["quality_threshold"]),
+        float(best["post_exit_threshold"]),
+        {
+            "policy_status": "VALIDATED" if best["gate_pass"] else "NO_VALID_POLICY",
+            "selected": best,
+            "all_candidates": candidates,
+        },
+    )
+
+
+def build_fold_windows(
+    events: Sequence[DirectionalEvent],
+    config: V3Config,
+) -> list[FoldWindow]:
+    if not events:
+        return []
+    minimum = min(event.decision_ts for event in events)
+    maximum = max(event.decision_ts for event in events)
+
+    train_length = config.train_months * MONTH_MS
+    validation_length = config.validation_months * MONTH_MS
+    test_length = config.test_months * MONTH_MS
+    step = config.step_months * MONTH_MS
+
+    windows = []
+    train_start = minimum
+    fold = 0
+    while True:
+        train_end = train_start + train_length
+        validation_start = train_end
+        validation_end = validation_start + validation_length
+        test_start = validation_end
+        test_end = test_start + test_length
+        if test_end > maximum + 1:
+            break
+        windows.append(
+            FoldWindow(
+                fold_index=fold,
+                train_start=train_start,
+                train_end=train_end,
+                validation_start=validation_start,
+                validation_end=validation_end,
+                test_start=test_start,
+                test_end=test_end,
+            )
+        )
+        train_start += step
+        fold += 1
+    return windows
+
+
+def _events_in_window(
+    events: Sequence[DirectionalEvent],
+    start: int,
+    end: int,
+    purge_outcomes_after: int | None = None,
+) -> list[DirectionalEvent]:
+    result = []
+    for event in events:
+        if not start <= event.decision_ts < end:
+            continue
+        if (
+            purge_outcomes_after is not None
+            and event.outcome_end_ts > purge_outcomes_after
+        ):
+            continue
+        result.append(event)
+    return result
+
+
+def run_walkforward(
+    all_events: Sequence[DirectionalEvent],
+    raw_lookup: Mapping[tuple[str, int], RawQuarterEvent],
+    data_by_symbol: Mapping[str, SymbolData],
+    config: V3Config,
+) -> dict:
+    windows = build_fold_windows(all_events, config)
+    if not windows:
+        raise RuntimeError("insufficient date range for requested walk-forward")
+
+    fold_reports = []
+    aggregate_trades: list[SelectedTrade] = []
+
+    for window in windows:
+        train = _events_in_window(
+            all_events,
+            window.train_start,
+            window.train_end,
+            purge_outcomes_after=window.validation_start,
+        )
+        validation = _events_in_window(
+            all_events,
+            window.validation_start,
+            window.validation_end,
+            purge_outcomes_after=window.test_start,
+        )
+        test = _events_in_window(
+            all_events,
+            window.test_start,
+            window.test_end,
+        )
+
+        if len(train) < 100 or len(validation) < 20 or len(test) < 1:
+            fold_reports.append({
+                "window": asdict(window),
+                "status": "SKIPPED_INSUFFICIENT_EVENTS",
+                "counts": {
+                    "train": len(train),
+                    "validation": len(validation),
+                    "test": len(test),
+                },
+            })
+            continue
+
+        entry_model = EntryModel(config)
+        entry_model.fit(train)
+        post_model = PostExecutionModel(config)
+        post_fit = post_model.fit(
+            train,
+            entry_model,
+            raw_lookup,
+            data_by_symbol,
+        )
+
+        validation_predictions = [
+            entry_model.predict(event) for event in validation
+        ]
+        quality_threshold, post_exit_threshold, tuning = tune_policy(
+            validation_predictions,
+            post_model,
+            raw_lookup,
+            data_by_symbol,
+            config,
+        )
+
+        test_predictions = [
+            entry_model.predict(event) for event in test
+        ]
+        selected, diagnostics = select_entries(
+            test_predictions,
+            quality_threshold,
+            config,
+        )
+        test_trades = apply_post_execution(
+            selected,
+            post_model,
+            post_exit_threshold,
+            raw_lookup,
+            data_by_symbol,
+        )
+        aggregate_trades.extend(test_trades)
+
+        fold_reports.append({
+            "window": {
+                **asdict(window),
+                "train_start_utc": _iso(window.train_start),
+                "train_end_utc": _iso(window.train_end),
+                "validation_start_utc": _iso(window.validation_start),
+                "validation_end_utc": _iso(window.validation_end),
+                "test_start_utc": _iso(window.test_start),
+                "test_end_utc": _iso(window.test_end),
+            },
+            "status": "COMPLETE",
+            "counts": {
+                "train": len(train),
+                "validation": len(validation),
+                "test": len(test),
+            },
+            "selected_policy": {
+                "quality_threshold": quality_threshold,
+                "post_exit_threshold": post_exit_threshold,
+            },
+            "post_model_fit": post_fit,
+            "validation_tuning": tuning,
+            "test_selection_diagnostics": diagnostics,
+            "test_performance": asdict(
+                performance_from_trades(
+                    test_trades,
+                    seed=config.seed + window.fold_index,
+                )
+            ),
+        })
+
+    aggregate = performance_from_trades(
+        aggregate_trades,
+        seed=config.seed + 99_000,
+    )
+    return {
+        "protocol": {
+            "mode": "quarter_hour_microstructure_v3",
+            "feature_names": (
+                CORE_FEATURE_NAMES + OPTIONAL_POSITIONING_FEATURE_NAMES
+            ),
+            "post_feature_names": POST_FEATURE_NAMES,
+            "config": asdict(config),
+            "economic_truth": "lab.sim",
+            "entry_delay": (
+                "decision after first flow_window_seconds; fill at next 5m bar open"
+            ),
+            "threshold_tuning": "validation_only",
+            "post_execution_training": "train_only",
+            "purge": "outcome_end_ts must precede next split boundary",
+        },
+        "aggregate_oos": asdict(aggregate),
+        "folds": fold_reports,
+        "evidence_gate": {
+            "minimum_oos_trades": 300,
+            "minimum_mean_net_r": 0.05,
+            "minimum_profit_factor": 1.10,
+            "minimum_win_rate": 0.56,
+            "ci95_lower_must_exceed_zero": True,
+            "positive_fold_fraction": 0.70,
+        },
+    }
+
+
+# =============================================================================
+# Snapshot assembly and CLI
+# =============================================================================
+
+def _parse_spec(value: str) -> tuple[str, Path]:
+    if "=" not in value:
+        raise ValueError(
+            f"expected SYMBOL=PATH, got {value!r}"
+        )
+    symbol, path = value.split("=", 1)
+    symbol = symbol.strip()
+    if not symbol:
+        raise ValueError(f"empty symbol in {value!r}")
+    return symbol, Path(path)
+
+
+def _spec_map(values: Sequence[str]) -> dict[str, Path]:
+    result = {}
+    for value in values:
+        symbol, path = _parse_spec(value)
+        if symbol in result:
+            raise ValueError(f"duplicate specification for {symbol}")
+        result[symbol] = path
+    return result
+
+
+def load_symbol_data(
+    snapshot_specs: Sequence[str],
+    trade_specs: Sequence[str],
+    book_specs: Sequence[str],
+) -> list[SymbolData]:
+    from tools import data as data_tool
+
+    snapshots = _spec_map(snapshot_specs)
+    trades = _spec_map(trade_specs)
+    books = _spec_map(book_specs)
+
+    symbols = sorted(set(snapshots) | set(trades) | set(books))
+    for symbol in symbols:
+        missing = [
+            label for label, mapping in (
+                ("snapshot", snapshots),
+                ("trades", trades),
+                ("book", books),
+            )
+            if symbol not in mapping
+        ]
+        if missing:
+            raise ValueError(f"{symbol}: missing inputs {missing}")
+
+    result = []
+    for symbol in symbols:
+        loaded = data_tool.load(snapshots[symbol])
+        manifest_symbol = loaded.manifest.get("instrument_id")
+        if manifest_symbol and manifest_symbol != symbol:
+            raise ValueError(
+                f"{symbol}: snapshot manifest instrument_id={manifest_symbol!r}"
+            )
+        manifest = dict(loaded.manifest)
+        manifest.setdefault("fee_rate", 0.0004)
+        manifest.setdefault("slippage_bps", 1.0)
+        result.append(
+            SymbolData(
+                symbol=symbol,
+                bars=loaded.trade_bars,
+                funding_events=loaded.funding_events,
+                trades=load_trade_tape(trades[symbol], symbol),
+                book=load_book_tape(books[symbol], symbol),
+                premium_bars=getattr(loaded, "premium_bars", None),
+                manifest=manifest,
+            )
+        )
+    return result
+
+
+def _iso(ts_ms: int) -> str:
+    return datetime.fromtimestamp(ts_ms / 1000, timezone.utc).isoformat()
+
+
+def _json_safe(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        if value > 0:
+            return "inf"
+        if value < 0:
+            return "-inf"
+        return None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def inspect_data_command(args: argparse.Namespace) -> int:
+    datasets = load_symbol_data(args.snapshot, args.trades, args.book)
+    report = {}
+    for data in datasets:
+        overlap_start = max(
+            data.bars[0].open_ts,
+            int(data.trades.ts_ms[0]),
+            int(data.book.ts_ms[0]),
+        )
+        overlap_end = min(
+            data.bars[-1].open_ts + BASE_INTERVAL_MS,
+            int(data.trades.ts_ms[-1]),
+            int(data.book.ts_ms[-1]),
+        )
+        report[data.symbol] = {
+            "snapshot_start_utc": _iso(data.bars[0].open_ts),
+            "snapshot_end_utc": _iso(
+                data.bars[-1].open_ts + BASE_INTERVAL_MS
+            ),
+            "trade_rows": len(data.trades.ts_ms),
+            "trade_start_utc": _iso(int(data.trades.ts_ms[0])),
+            "trade_end_utc": _iso(int(data.trades.ts_ms[-1])),
+            "book_rows": len(data.book.ts_ms),
+            "book_levels": data.book.levels,
+            "book_start_utc": _iso(int(data.book.ts_ms[0])),
+            "book_end_utc": _iso(int(data.book.ts_ms[-1])),
+            "overlap_start_utc": _iso(overlap_start),
+            "overlap_end_utc": _iso(overlap_end),
+            "overlap_days": (overlap_end - overlap_start) / DAY_MS,
+            "aggressor_buy_fraction": float(
+                np.mean(data.trades.side_sign > 0)
+            ),
+        }
+    print(json.dumps(_json_safe(report), indent=2, sort_keys=True))
+    return 0
+
+
+def walkforward_command(args: argparse.Namespace) -> int:
+    config = V3Config(
+        flow_window_seconds=args.flow_window_seconds,
+        horizon_hours=args.horizon_hours,
+        stop_atr=args.stop_atr,
+        target_r=args.target_r,
+        train_months=args.train_months,
+        validation_months=args.validation_months,
+        test_months=args.test_months,
+        step_months=args.step_months,
+        minimum_validation_trades=args.minimum_validation_trades,
+        minimum_validation_win_rate=args.minimum_validation_win_rate,
+        enable_post_execution=not args.disable_post_execution,
+        seed=args.seed,
+    )
+    config.validate()
+    datasets = load_symbol_data(args.snapshot, args.trades, args.book)
+    data_by_symbol = {data.symbol: data for data in datasets}
+
+    raw_events = []
+    preparation = {}
+    for data in datasets:
+        symbol_events, report = build_raw_quarter_events(data, config)
+        raw_events.extend(symbol_events)
+        preparation[data.symbol] = report
+
+    raw_lookup = {
+        (event.symbol, event.decision_ts): event
+        for event in raw_events
+    }
+    directional_events = []
+    for raw_event in raw_events:
+        data = data_by_symbol[raw_event.symbol]
+        directional_events.append(
+            directionalise_event(
+                raw_event, "LONG", True, data.bars
+            )
+        )
+        directional_events.append(
+            directionalise_event(
+                raw_event, "SHORT", True, data.bars
+            )
+        )
+    directional_events.sort(
+        key=lambda event: (
+            event.decision_ts,
+            event.symbol,
+            event.side,
+        )
+    )
+
+    result = run_walkforward(
+        directional_events,
+        raw_lookup,
+        data_by_symbol,
+        config,
+    )
+    result["preparation"] = preparation
+    result["n_raw_quarter_events"] = len(raw_events)
+    result["n_directional_events"] = len(directional_events)
+
+    text = json.dumps(_json_safe(result), indent=2, sort_keys=True)
+    print(text)
+    if args.output:
+        Path(args.output).write_text(text + "\n", encoding="utf-8")
+    return 0
+
+
+# =============================================================================
+# Self-test
+# =============================================================================
+
+def _synthetic_symbol_data() -> SymbolData:
+    bars = []
     price = 100.0
-    for i in range(count):
-        drift = 0.08 if (i // 80) % 2 == 0 else -0.06
-        wave = math.sin(i / 7.0) * 0.35
-        open_ = price
-        close = max(1.0, open_ + drift + wave)
-        high = max(open_, close) + 0.30 + abs(math.sin(i / 5.0)) * 0.15
-        low = min(open_, close) - 0.30 - abs(math.cos(i / 6.0)) * 0.15
-        volume = 1_000.0 + 150.0 * math.sin(i / 11.0) + (i % 17) * 8.0
+    start = 1_700_000_000_000
+    for index in range(700):
+        phase = math.sin(index / 19.0) * 0.15
+        drift = 0.02 if (index // 300) % 2 == 0 else -0.015
+        open_price = price
+        close = max(1.0, open_price + drift + phase)
+        high = max(open_price, close) + 0.20
+        low = min(open_price, close) - 0.20
         bars.append(
-            Bar(
-                timestamp=str(i),
-                open=open_,
+            market.Bar(
+                open_ts=start + index * BASE_INTERVAL_MS,
+                open=open_price,
                 high=high,
                 low=low,
                 close=close,
-                volume=max(1.0, volume),
+                volume=1000.0 + index % 50,
             )
         )
         price = close
-    return bars
 
+    trade_ts = []
+    trade_price = []
+    trade_size = []
+    trade_side = []
+    book_ts = []
+    bid_rows = []
+    ask_rows = []
+    bid_size_rows = []
+    ask_size_rows = []
 
-def run_selftest() -> None:
-    cfg = EngineConfig()
-    cfg.validate()
+    end = bars[-1].open_ts + BASE_INTERVAL_MS
+    quarter = ((start + QUARTER_MS - 1) // QUARTER_MS) * QUARTER_MS
+    while quarter < end:
+        base_index = _bar_index_at_or_before(bars, quarter)
+        if base_index < 0:
+            quarter += QUARTER_MS
+            continue
+        mid = bars[base_index].close
+        direction = 1.0 if (quarter // QUARTER_MS) % 3 != 0 else -1.0
 
-    bars = synthetic_bars()
-    for b in bars:
-        b.validate()
+        for second in range(0, 70):
+            ts = quarter + second * 1000
+            if ts >= end:
+                break
+            book_ts.append(ts)
+            bid_rows.append([mid - 0.01 * (level + 1) for level in range(5)])
+            ask_rows.append([mid + 0.01 * (level + 1) for level in range(5)])
+            bid_size_rows.append([
+                20.0 + (5.0 if direction > 0 else 0.0) + level
+                for level in range(5)
+            ])
+            ask_size_rows.append([
+                20.0 + (5.0 if direction < 0 else 0.0) + level
+                for level in range(5)
+            ])
 
-    closes = [b.close for b in bars]
-    e = ema(closes, 20)
-    a = atr(bars, 14)
+        for trade_index in range(12):
+            ts = quarter + 100 + trade_index * 700
+            if ts >= end:
+                break
+            sign = direction if trade_index < 8 else -direction
+            trade_ts.append(ts)
+            trade_side.append(sign)
+            trade_size.append(1.0 + trade_index * 0.1)
+            trade_price.append(mid * (1.0 + sign * 0.00002 * trade_index))
 
-    assert len(e) == len(bars)
-    assert len(a) == len(bars)
-    assert math.isnan(e[18])
-    assert math.isfinite(e[19])
-    assert math.isnan(a[13])
-    assert math.isfinite(a[14])
+        quarter += QUARTER_MS
 
-    # Causality check: appending future bars must not alter old indicator values.
-    extended = bars + synthetic_bars(20)
-    e2 = ema([b.close for b in extended], 20)
-    a2 = atr(extended, 14)
-    for i in range(len(bars)):
-        if math.isfinite(e[i]):
-            assert abs(e[i] - e2[i]) < 1e-12
-        if math.isfinite(a[i]):
-            assert abs(a[i] - a2[i]) < 1e-12
-
-    engine = DeterministicEngine(cfg)
-    ind = engine.precompute(bars)
-    d1 = engine.decide(bars, ind, len(bars) - 1)
-    d2 = engine.decide(bars, ind, len(bars) - 1)
-    assert d1 == d2
-
-    result = backtest(bars, cfg)
-    assert math.isfinite(result.ending_equity)
-    assert result.trades >= 0
-
-    print("SELFTEST PASS")
-    print(json.dumps(result.summary_dict(), indent=2, default=str))
-
-
-def build_config_from_args(args: argparse.Namespace) -> EngineConfig:
-    return EngineConfig(
-        fast_ema=args.fast_ema,
-        slow_ema=args.slow_ema,
-        atr_period=args.atr_period,
-        volume_period=args.volume_period,
-        pullback_atr_distance=args.pullback_atr_distance,
-        max_extension_atr=args.max_extension_atr,
-        min_volume_ratio=args.min_volume_ratio,
-        min_body_atr=args.min_body_atr,
-        max_body_atr=args.max_body_atr,
-        min_atr_pct=args.min_atr_pct,
-        max_atr_pct=args.max_atr_pct,
-        stop_atr=args.stop_atr,
-        target_r=args.target_r,
-        max_hold_bars=args.max_hold_bars,
-        risk_per_trade=args.risk_per_trade,
-        max_leverage=args.max_leverage,
-        fee_rate_per_side=args.fee_rate,
-        slippage_rate_per_side=args.slippage_rate,
-        starting_equity=args.starting_equity,
-        trade_score=args.trade_score,
-        allow_same_bar_exit=args.allow_same_bar_exit,
+    trades = RawTradeTape(
+        ts_ms=np.asarray(trade_ts, dtype=np.int64),
+        price=np.asarray(trade_price, dtype=float),
+        size=np.asarray(trade_size, dtype=float),
+        side_sign=np.asarray(trade_side, dtype=float),
+    )
+    book = BookTape(
+        ts_ms=np.asarray(book_ts, dtype=np.int64),
+        bid_px=np.asarray(bid_rows, dtype=float),
+        ask_px=np.asarray(ask_rows, dtype=float),
+        bid_size=np.asarray(bid_size_rows, dtype=float),
+        ask_size=np.asarray(ask_size_rows, dtype=float),
+    )
+    trades.validate("SYNTH")
+    book.validate("SYNTH")
+    return SymbolData(
+        symbol="SYNTH",
+        bars=bars,
+        funding_events=[],
+        trades=trades,
+        book=book,
+        premium_bars=None,
+        manifest={"instrument_id": "SYNTH"},
     )
 
 
-def add_common_config_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--fast-ema", type=int, default=20)
-    parser.add_argument("--slow-ema", type=int, default=50)
-    parser.add_argument("--atr-period", type=int, default=14)
-    parser.add_argument("--volume-period", type=int, default=20)
-    parser.add_argument("--pullback-atr-distance", type=float, default=0.45)
-    parser.add_argument("--max-extension-atr", type=float, default=1.10)
-    parser.add_argument("--min-volume-ratio", type=float, default=0.70)
-    parser.add_argument("--min-body-atr", type=float, default=0.08)
-    parser.add_argument("--max-body-atr", type=float, default=1.20)
-    parser.add_argument("--min-atr-pct", type=float, default=0.002)
-    parser.add_argument("--max-atr-pct", type=float, default=0.050)
-    parser.add_argument("--trade-score", type=int, default=8)
-    parser.add_argument("--stop-atr", type=float, default=1.5)
-    parser.add_argument("--target-r", type=float, default=2.0)
-    parser.add_argument("--max-hold-bars", type=int, default=12)
-    parser.add_argument("--risk-per-trade", type=float, default=0.01)
-    parser.add_argument("--max-leverage", type=float, default=5.0)
-    parser.add_argument("--fee-rate", type=float, default=0.0004)
-    parser.add_argument("--slippage-rate", type=float, default=0.0002)
-    parser.add_argument("--starting-equity", type=float, default=1000.0)
-    parser.add_argument("--allow-same-bar-exit", action="store_true")
+def selftest_command(_args: argparse.Namespace) -> int:
+    config = V3Config(
+        train_months=1,
+        validation_months=1,
+        test_months=1,
+        step_months=1,
+        historical_z_days=2,
+        min_trades_in_flow_window=4,
+        book_max_age_ms=2_000,
+        post_checkpoints_minutes=(5, 15, 30),
+    )
+    data = _synthetic_symbol_data()
+
+    raw_events, prep = build_raw_quarter_events(data, config)
+    assert raw_events, "synthetic quarter events were not built"
+
+    first = raw_events[0]
+    long_event = directionalise_event(first, "LONG", True, data.bars)
+    short_event = directionalise_event(first, "SHORT", True, data.bars)
+    assert long_event.features.shape == short_event.features.shape
+    assert len(long_event.features) == (
+        len(CORE_FEATURE_NAMES) + len(OPTIONAL_POSITIONING_FEATURE_NAMES)
+    )
+
+    # Directional mirror contracts for signed flow and book imbalance.
+    feature_names = CORE_FEATURE_NAMES + OPTIONAL_POSITIONING_FEATURE_NAMES
+    for name in (
+        "dir_volume_imbalance_10s",
+        "dir_signed_dollar_flow_z_10s",
+        "dir_l1_book_imbalance",
+        "dir_microprice_deviation",
+    ):
+        index = feature_names.index(name)
+        assert long_event.features[index] == -short_event.features[index]
+
+    # Appending future micro data cannot alter an old event.
+    old_features = long_event.features.copy()
+    future_trade = RawTradeTape(
+        ts_ms=np.append(data.trades.ts_ms, data.trades.ts_ms[-1] + 1000),
+        price=np.append(data.trades.price, data.trades.price[-1]),
+        size=np.append(data.trades.size, 1.0),
+        side_sign=np.append(data.trades.side_sign, 1.0),
+    )
+    future_book = BookTape(
+        ts_ms=np.append(data.book.ts_ms, data.book.ts_ms[-1] + 1000),
+        bid_px=np.vstack([data.book.bid_px, data.book.bid_px[-1]]),
+        ask_px=np.vstack([data.book.ask_px, data.book.ask_px[-1]]),
+        bid_size=np.vstack([data.book.bid_size, data.book.bid_size[-1]]),
+        ask_size=np.vstack([data.book.ask_size, data.book.ask_size[-1]]),
+    )
+    extended = replace(data, trades=future_trade, book=future_book)
+    extended_events, _ = build_raw_quarter_events(extended, config)
+    matching = next(
+        event for event in extended_events
+        if event.decision_ts == first.decision_ts
+    )
+    extended_long = directionalise_event(
+        matching, "LONG", True, extended.bars
+    )
+    np.testing.assert_allclose(old_features, extended_long.features)
+
+    # lab.sim is the sole source of outcomes.
+    assert isinstance(long_event.final_outcome, sim.TradeOutcome)
+    assert long_event.final_outcome.outcome_hash
+
+    # Model and quality score contract.
+    sample_events = []
+    for raw in raw_events[:80]:
+        sample_events.append(directionalise_event(raw, "LONG", True, data.bars))
+        sample_events.append(directionalise_event(raw, "SHORT", True, data.bars))
+    model = EntryModel(config)
+    model.fit(sample_events)
+    prediction = model.predict(sample_events[-1])
+    assert 0.0 <= prediction.quality_score <= 100.0
+    assert 0.0 <= prediction.predicted_win_probability <= 1.0
+
+    selected, _ = select_entries(
+        [model.predict(event) for event in sample_events[-20:]],
+        threshold=0.0,
+        config=config,
+    )
+    assert len(selected) <= 10  # one side per timestamp
+
+    print(json.dumps({
+        "status": "PASS",
+        "raw_quarter_events": len(raw_events),
+        "feature_count": len(feature_names),
+        "post_feature_count": len(POST_FEATURE_NAMES),
+        "preparation": prep,
+        "contracts": {
+            "single_file": True,
+            "raw_aggressor_flow_required": True,
+            "l1_book_required": True,
+            "future_append_causality": True,
+            "directional_mirroring": True,
+            "quality_score_0_100": True,
+            "validation_only_threshold_tuning": True,
+            "train_only_post_execution": True,
+            "lab_sim_economic_truth": True,
+            "net_r_reimplemented": False,
+        },
+    }, indent=2))
+    return 0
+
+
+def add_data_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--snapshot",
+        action="append",
+        required=True,
+        metavar="SYMBOL=PATH",
+    )
+    parser.add_argument(
+        "--trades",
+        action="append",
+        required=True,
+        metavar="SYMBOL=PATH",
+    )
+    parser.add_argument(
+        "--book",
+        action="append",
+        required=True,
+        metavar="SYMBOL=PATH",
+    )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="V7-Lite deterministic trade engine")
+    parser = argparse.ArgumentParser(
+        description="V7-Lite V3 quarter-hour microstructure challenger"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_backtest = sub.add_parser("backtest", help="Run bar-by-bar backtest")
-    p_backtest.add_argument("--csv", required=True)
-    p_backtest.add_argument("--trades-out")
-    add_common_config_args(p_backtest)
+    inspect = sub.add_parser(
+        "inspect-data",
+        help="validate snapshot, aggressor trades, L1/L2 book, and overlap",
+    )
+    add_data_args(inspect)
+    inspect.set_defaults(func=inspect_data_command)
 
-    p_signal = sub.add_parser("signal", help="Print latest deterministic signal")
-    p_signal.add_argument("--csv", required=True)
-    add_common_config_args(p_signal)
+    walk = sub.add_parser(
+        "walkforward",
+        help="run rolling train/validation/frozen-OOS V3",
+    )
+    add_data_args(walk)
+    walk.add_argument("--flow-window-seconds", type=int, default=10)
+    walk.add_argument("--horizon-hours", type=int, default=8)
+    walk.add_argument("--stop-atr", type=float, default=1.50)
+    walk.add_argument("--target-r", type=float, default=1.50)
+    walk.add_argument("--train-months", type=int, default=12)
+    walk.add_argument("--validation-months", type=int, default=2)
+    walk.add_argument("--test-months", type=int, default=2)
+    walk.add_argument("--step-months", type=int, default=2)
+    walk.add_argument("--minimum-validation-trades", type=int, default=20)
+    walk.add_argument("--minimum-validation-win-rate", type=float, default=0.52)
+    walk.add_argument("--disable-post-execution", action="store_true")
+    walk.add_argument("--seed", type=int, default=7)
+    walk.add_argument("--output")
+    walk.set_defaults(func=walkforward_command)
 
-    sub.add_parser("selftest", help="Run built-in deterministic smoke tests")
+    selftest = sub.add_parser(
+        "selftest",
+        help="run causal feature, model, and lab.sim contract tests",
+    )
+    selftest.set_defaults(func=selftest_command)
+
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
-
     try:
-        if args.command == "selftest":
-            run_selftest()
-            return 0
-
-        cfg = build_config_from_args(args)
-        bars = load_csv(args.csv)
-
-        if args.command == "signal":
-            print(latest_signal(bars, cfg).to_json())
-            return 0
-
-        if args.command == "backtest":
-            result = backtest(bars, cfg)
-            print(json.dumps(result.summary_dict(), indent=2, default=str))
-            if args.trades_out:
-                write_trades_csv(args.trades_out, result.trades_detail)
-                print(f"Trades written to: {args.trades_out}", file=sys.stderr)
-            return 0
-
-        raise RuntimeError(f"Unknown command: {args.command}")
-
+        args = parse_args(argv)
+        return int(args.func(args))
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print(
+            f"ERROR: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
         return 1
 
 

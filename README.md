@@ -13,9 +13,11 @@ lab/
   sim.py          Deterministic truth core — net_R, labels, outcomes
   events.py       Candidate-event authority — observe() + build_events()
   evaluate.py     Evaluation authority — baselines, negative controls, ledger
+  features.py     Declared feature surface — directional momentum + volatility
 tools/
-  data.py         OKX data acquisition — build, load, verify, observe, universe CLI
+  data.py         Snapshot load/verify (Binance authority)
   download_binance.py  Binance data acquisition + compilation
+  evidence.py     Phase 6 hypothesis evidence — baseline ladder + OOS verdict
   export_llm.py        LLM context snapshot builder
 specs/
   hunter_candidate_v0.json   Locked HunterSpec V0 geometry (wide_1h)
