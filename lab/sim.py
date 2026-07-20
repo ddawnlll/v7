@@ -456,9 +456,3 @@ def _validate_spec(spec: TradeSpec, n: int) -> None:
     else:
         if not (spec.target_price < spec.entry_price < spec.stop_price):
             raise ValueError("SHORT requires target < entry < stop")
-    if not _finite_number(spec.entry_price):
-        raise ValueError(f"entry_price must be finite, got {spec.entry_price}")
-    if not _finite_number(spec.stop_price):
-        raise ValueError(f"stop_price must be finite, got {spec.stop_price}")
-    if not _finite_number(spec.target_price):
-        raise ValueError(f"target_price must be finite, got {spec.target_price}")
