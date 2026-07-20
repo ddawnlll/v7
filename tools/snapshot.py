@@ -532,8 +532,14 @@ def _funding_events(
 
 def load(snapshot_dir: Path) -> LoadedSnapshot:
     """Load, re-verify and return one snapshot's contents. Fails closed:
-    raises if any tape's re-derived hash disagrees with the manifest, or if
-    the manifest records incomplete coverage for trade or mark."""
+    raises if any tape's re-derived hash disagrees with the manifest, if the
+    manifest records incomplete coverage for trade or mark, if the on-disk
+    bar count disagrees with what the requested window implies (the
+    coverage_complete flag is manifest-authored, not re-derived — a stale or
+    hand-edited manifest must not be trusted on its word alone), or if the
+    trade and mark tapes are not index-aligned (``_funding_events`` below
+    reads ``mark_bars[idx]`` for the trade bar at the same ``idx`` and would
+    silently attach the wrong settlement price if the two tapes drifted)."""
     manifest = json.loads((snapshot_dir / "manifest.json").read_text())
 
     if not manifest["trade"]["coverage_complete"]:
@@ -550,6 +556,30 @@ def load(snapshot_dir: Path) -> LoadedSnapshot:
     trade_bars = _read_trade_bars(snapshot_dir / "trade_bars_5m.parquet")
     mark_bars = _read_mark_bars(snapshot_dir / "mark_bars_5m.parquet")
     funding_records = _read_funding_records(snapshot_dir / "funding_events.parquet")
+
+    interval_ms = INTERVAL_MS[manifest["bar"]]
+    expected_bars = (
+        manifest["requested_end_ts"] - manifest["requested_start_ts"]
+    ) // interval_ms
+    if len(trade_bars) != expected_bars:
+        raise ValueError(
+            f"{snapshot_dir}: trade tape has {len(trade_bars)} bars but the "
+            f"requested window implies {expected_bars} — manifest claims "
+            "coverage_complete=true; refusing to trust that flag alone"
+        )
+    if len(mark_bars) != expected_bars:
+        raise ValueError(
+            f"{snapshot_dir}: mark tape has {len(mark_bars)} bars but the "
+            f"requested window implies {expected_bars} — manifest claims "
+            "coverage_complete=true; refusing to trust that flag alone"
+        )
+    if any(t.open_ts != m.open_ts for t, m in zip(trade_bars, mark_bars)):
+        raise ValueError(
+            f"{snapshot_dir}: trade and mark tapes are not index-aligned "
+            "(different open_ts at the same position) — funding-event "
+            "mapping reads mark_bars[idx] for trade_bars[idx] and requires "
+            "identical timestamps at every index"
+        )
 
     checks = [
         ("trade", data.dataset_hash(trade_bars), manifest["trade"]["dataset_hash"]),

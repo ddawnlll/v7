@@ -174,3 +174,68 @@ def test_incomplete_mark_coverage_rejected(tmp_path):
     _write_snapshot(tmp_path, mark_complete=False)
     with pytest.raises(ValueError, match="coverage_complete=false"):
         sn.load(tmp_path)
+
+
+def test_bar_count_short_of_expected_rejected_even_if_flagged_complete(tmp_path):
+    """coverage_complete=true is manifest-authored, not re-derived — a
+    truncated tape mislabeled complete must not silently pass."""
+    short_trade = _TRADE_BARS[:2]  # window (0, 900_000) implies 3 bars
+    sn.write_trade_parquet(short_trade, tmp_path / "trade_bars_5m.parquet")
+    sn.write_mark_parquet(_MARK_BARS, tmp_path / "mark_bars_5m.parquet")
+    sn.write_funding_parquet(_FUNDING_RECORDS, tmp_path / "funding_events.parquet")
+    (tmp_path / "instrument.json").write_text(json.dumps({"instId": "TEST-SWAP"}))
+
+    manifest = {
+        "inst_id": "TEST-SWAP",
+        "bar": "5m",
+        "requested_start_ts": 0,
+        "requested_end_ts": 900_000,
+        "trade": {
+            "coverage_complete": True,
+            "dataset_hash": data.dataset_hash(short_trade),
+        },
+        "mark": {
+            "coverage_complete": True,
+            "dataset_hash": data.mark_dataset_hash(_MARK_BARS),
+        },
+        "funding": {"dataset_hash": data.funding_dataset_hash(_FUNDING_RECORDS)},
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="implies 3"):
+        sn.load(tmp_path)
+
+
+def test_trade_mark_misalignment_rejected(tmp_path):
+    """Trade and mark tapes must share the same open_ts sequence — funding
+    events are mapped onto both by index, so a silently misaligned mark
+    tape would attach the wrong settlement price to a funding event."""
+    shifted_mark = [
+        data.MarkBar(open_ts=b.open_ts + 300_000, open=b.open, high=b.high,
+                     low=b.low, close=b.close)
+        for b in _MARK_BARS
+    ]
+    sn.write_trade_parquet(_TRADE_BARS, tmp_path / "trade_bars_5m.parquet")
+    sn.write_mark_parquet(shifted_mark, tmp_path / "mark_bars_5m.parquet")
+    sn.write_funding_parquet(_FUNDING_RECORDS, tmp_path / "funding_events.parquet")
+    (tmp_path / "instrument.json").write_text(json.dumps({"instId": "TEST-SWAP"}))
+
+    manifest = {
+        "inst_id": "TEST-SWAP",
+        "bar": "5m",
+        "requested_start_ts": 0,
+        "requested_end_ts": 900_000,
+        "trade": {
+            "coverage_complete": True,
+            "dataset_hash": data.dataset_hash(_TRADE_BARS),
+        },
+        "mark": {
+            "coverage_complete": True,
+            "dataset_hash": data.mark_dataset_hash(shifted_mark),
+        },
+        "funding": {"dataset_hash": data.funding_dataset_hash(_FUNDING_RECORDS)},
+    }
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+
+    with pytest.raises(ValueError, match="not index-aligned"):
+        sn.load(tmp_path)
