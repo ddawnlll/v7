@@ -47,7 +47,7 @@ def _event(decision_ts: int, side: str, net_r: float,
 
 
 def _flat_bars(n: int = 30) -> list[Bar]:
-    return [Bar(open_ts=i * 300_000 + 4500000, open=100.0, high=101.0, low=99.0,
+    return [Bar(open_ts=i * 300_000, open=100.0, high=101.0, low=99.0,
                 close=100.0, volume=1.0) for i in range(n)]
 
 
