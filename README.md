@@ -22,7 +22,10 @@ lab/
                   Reference engine (scalar, hand-verifiable). Nothing else computes money.
   indicators.py   Pure, causal research primitives. Never imported by sim.py.
   tests/          Verification. Every claim is a test.
-salvage/          Code copied from v7-engine. UNAUDITED. Quarantined — see RULES.md.
+tools/
+  snapshot.py     Only file touching network/disk/wall-clock: build, load, observe.
+salvage/          Quarantine for code copied from v7-engine, UNAUDITED — see
+                  RULES.md §2. Currently empty; nothing has entered quarantine yet.
 ```
 
 ## Status
