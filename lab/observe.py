@@ -32,8 +32,8 @@ from typing import Sequence
 
 import numpy as np
 
-from lab import data, indicators, sim
-from lab.data import Bar
+from lab import indicators, sim, tape
+from lab.tape import Bar
 
 ATR_PERIOD = 14
 BASE_INTERVAL_MS = 300_000  # 5m — ARCHITECTURE §8.1 raw authority interval
@@ -154,7 +154,7 @@ def _candidate_decisions(
         return
 
     factor = setup.decision_interval_factor
-    derived = data.aggregate(trade_bars, factor, BASE_INTERVAL_MS)
+    derived = tape.aggregate(trade_bars, factor, BASE_INTERVAL_MS)
     if len(derived) <= ATR_PERIOD:
         return
     d_atr = indicators.compute_atr(

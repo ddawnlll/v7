@@ -1,0 +1,20 @@
+# Mutation audit for the truth core (RULES §14). Not part of the pytest suite —
+# run on demand at an authority gate, on the remote box (RULES §15), never locally.
+#
+# Verify (remote, ~/v7):
+#   cosmic-ray baseline cosmic-ray.toml
+#   cosmic-ray init cosmic-ray.toml mutation.sqlite
+#   cosmic-ray exec cosmic-ray.toml mutation.sqlite
+#   cr-report mutation.sqlite
+#
+# Every SURVIVED mutant is either turned into a new test or recorded with a reason
+# it's an equivalent mutant (no behavior change) — never silently ignored (RULES §12).
+
+[cosmic-ray]
+module-path = "lab/sim.py"
+timeout = 20.0
+excluded-modules = []
+test-command = "python -m pytest lab/tests/test_sim.py -q"
+
+[cosmic-ray.distributor]
+name = "local"

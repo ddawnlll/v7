@@ -1,4 +1,4 @@
-"""Dataset builder — the single authority that turns raw candle and funding
+"""Market tape builder — the single authority that turns raw candle and funding
 records into a validated, hashable market tape (ROADMAP Phase 2).
 
 One row = one completed candle = one potential decision point. A decision at bar
@@ -44,9 +44,9 @@ Contents:
   to_funding_records   parse + validate raw funding records, fail-closed
   detect_gaps          find and report missing candles (never fill)
   aggregate            base interval -> higher interval, complete buckets only
-  canonical_bytes / dataset_hash                   trade tape identity
-  canonical_mark_bytes / mark_dataset_hash         mark tape identity
-  canonical_funding_bytes / funding_dataset_hash   funding tape identity
+  canonical_bytes / trade_tape_hash                trade tape identity
+  canonical_mark_bytes / mark_tape_hash            mark tape identity
+  canonical_funding_bytes / funding_tape_hash      funding tape identity
 """
 
 from __future__ import annotations
@@ -56,6 +56,7 @@ import math
 from dataclasses import dataclass
 from typing import Sequence
 
+# Schema version for verified tapes on disk
 SCHEMA_VERSION = "market-v0"
 
 
@@ -71,6 +72,10 @@ class Bar:
     low: float
     close: float
     volume: float
+    quote_volume: float | None = None
+    trade_count: int | None = None
+    taker_buy_base_volume: float | None = None
+    taker_buy_quote_volume: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,7 +364,7 @@ def canonical_bytes(bars: Sequence[Bar]) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def dataset_hash(bars: Sequence[Bar]) -> str:
+def trade_tape_hash(bars: Sequence[Bar]) -> str:
     """SHA-256 hex digest of ``canonical_bytes`` — the trade tape identity."""
     return _sha256_hex(canonical_bytes(bars))
 
@@ -374,7 +379,7 @@ def canonical_mark_bytes(bars: Sequence[MarkBar]) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def mark_dataset_hash(bars: Sequence[MarkBar]) -> str:
+def mark_tape_hash(bars: Sequence[MarkBar]) -> str:
     """SHA-256 hex digest of ``canonical_mark_bytes`` — the mark tape identity."""
     return _sha256_hex(canonical_mark_bytes(bars))
 
@@ -387,6 +392,6 @@ def canonical_funding_bytes(records: Sequence[FundingRecord]) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def funding_dataset_hash(records: Sequence[FundingRecord]) -> str:
+def funding_tape_hash(records: Sequence[FundingRecord]) -> str:
     """SHA-256 hex digest of ``canonical_funding_bytes`` — funding identity."""
     return _sha256_hex(canonical_funding_bytes(records))

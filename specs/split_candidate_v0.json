@@ -1,0 +1,6 @@
+{
+  "version": "split-v0",
+  "status": "CANDIDATE",
+  "boundary_utc": "2025-10-20T00:00:00Z",
+  "purge_by_outcome_end": true
+}

@@ -22,3 +22,7 @@ iniconfig==2.3.0
 packaging==26.2
 pluggy==1.6.0
 Pygments==2.20.0
+
+# Mutation audit (RULES §14/§16 verification, cosmic-ray.toml) — not imported by
+# lab/ or tools/ at runtime, only needed to run the sim.py mutation audit.
+cosmic-ray==8.4.6

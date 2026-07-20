@@ -52,7 +52,8 @@ No neural model runs before: random predictor, always-NO_TRADE, linear model, XG
 same data, same splits, same costs. NN must beat the ladder or explain why not.
 
 ## 11. Completion protocol
-Nothing is "done" until the operator has run the verify command (on the remote box)
+Nothing is "done" until the operator has run the verify command on the remote
+box (`ssh s_01kxx7ms62ag5ct0wja7h85hna@ssh.lightning.ai`, cwd `~/v7`)
 and seen it pass. Claude's summary is not evidence; the command output is.
 
 ## 12. No process theater
@@ -84,17 +85,45 @@ outcomes. Nothing else in the repo computes money. Inside `lab/sim.py`:
   (vectorized tape, CUDA) is parity-gated against the reference and is never the sole path.
 
 ## 15. Remote execution discipline
-The remote box has exactly one working directory (`~/v7`). No second clone, bundle, or
-extract is left there for a spot-check — if a throwaway copy is ever needed for a one-off
-comparison, it's deleted before the session ends. Ad hoc clones accumulate silently and
+The remote box is `s_01kxx7ms62ag5ct0wja7h85hna@ssh.lightning.ai`, working
+directory `~/v7`. No second clone, bundle, or extract is left there for a
+spot-check — if a throwaway copy is ever needed for a one-off comparison,
+it's deleted before the session ends. Ad hoc clones accumulate silently and
 create doubt about which commit was actually verified.
 
-Local is the sole source of truth. A one-way Mutagen sync (`sync-mode: one-way-replica`,
-alpha = local repo including `.git`, beta = remote `~/v7`) keeps them identical; a direct
-edit made on the remote is reverted, not merged — the remote is a mirror, never an editor.
-This is why `git tag`/`git log` on the remote always match local without a manual `git
-pull`: the sync carries `.git` itself, not just the working tree.
+Local is the sole source of truth. A one-way Mutagen sync (`sync-mode:
+one-way-replica`, sync every 2 seconds, alpha = local repo including `.git`,
+beta = remote `~/v7`) keeps them identical; a direct edit made on the
+remote is reverted, not merged — the remote is a mirror, never an editor.
+This is why `git tag`/`git log` on the remote always match local without a
+manual `git pull`: the sync carries `.git` itself at 2-second intervals, not
+just the working tree.
 
 This does not relax §11: the operator still runs the verify command on the remote box and
 sees it pass themselves. The sync only guarantees that "the code I have locally" and "the
 code the remote is testing" are never two different things.
+
+## 16. Golden provenance
+A hand-computed value counts as independent evidence only if it exists before the code it
+verifies. New golden values for `lab/sim.py`, `lab/indicators.py`, or any later locked
+authority are committed by the operator, in a commit that introduces no implementation
+change. An agent that writes the engine and the value checked against it in the same pass
+has produced one artifact, not two — commit order is the only proof that didn't happen.
+
+Goldens already in `lab/tests/test_sim.py` and `lab/tests/test_indicators.py` predate this
+rule and are not retroactively restructured; it binds from Phase 4 onward.
+
+## 17. Mutation gate
+`lab/sim.py` does not keep its `simulation-authority` tag past the next commit that
+touches that file without a clean `cosmic-ray.toml` run: baseline passes, then every
+SURVIVED mutant is either killed by a new test or recorded with the specific reason it
+is an equivalent mutant. No untriaged survivor. This is the same failure §16 targets: a
+shadow implementation that passes green while computing something other than what it
+claims to — mutation testing is what actually proves the suite exercises every line, not
+just that green tests exist.
+
+This does not retroactively reopen the tag recorded at commit `8117950`; it applies from
+the next commit that touches `lab/sim.py` onward.
+
+`lab/indicators.py` has no mutation config yet — this gate does not apply to it until a
+config covers it.

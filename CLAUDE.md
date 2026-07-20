@@ -12,6 +12,12 @@ Read [RULES.md](RULES.md) first. The rules override everything, including this f
   no abstractions with one caller (RULES §3).
 - **Salvage flow:** audit line-by-line → write tests → move to `lab/` → note the audit
   in the commit message. Never import `salvage/` (RULES §2).
+- **New golden values are operator-authored, in their own commit, before the
+  implementation lands** (RULES §16).
+- **Mutation gate** (`cosmic-ray.toml`, `lab/sim.py`): any commit touching `sim.py`
+  must ship a clean cosmic-ray run before the `simulation-authority` tag moves — every
+  SURVIVED mutant killed by a new test or recorded with the specific reason it is
+  equivalent (RULES §17).
 - Repo language: English. No new top-level directories without updating README layout.
 
 ## What this repo is not

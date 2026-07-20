@@ -1,0 +1,11 @@
+{
+  "spec_version": "hunter-candidate-v0",
+  "status": "CANDIDATE",
+  "decision_interval": "1h",
+  "simulation_interval": "5m",
+  "k_stop": 2.0,
+  "target_R": 3.0,
+  "target_atr": 6.0,
+  "max_holding_minutes": 1440,
+  "cost_policy": "all_taker_v0"
+}

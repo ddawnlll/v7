@@ -14,7 +14,7 @@ specific, predictable exit.
 """
 import pytest
 
-from lab.data import Bar
+from lab.tape import Bar
 from lab.observe import ATR_PERIOD, Setup, observe
 
 _SETUP = Setup("test", k_stop=1.0, reward_risk=2.0, max_holding_bars=3)
@@ -128,7 +128,7 @@ def test_too_short_series_yields_no_candidates_not_a_crash():
 
 # --- multi-interval decisioning (Stage B: decision_interval_factor > 1) -------
 #
-# Flat background bars aggregate (lab.data.aggregate) into flat 15m derived
+# Flat background bars aggregate (lab.tape.aggregate) into flat 15m derived
 # bars with the same constant-TR trick as above: every derived bar's true
 # range is 2.0, so ATR(14) on the *derived* series is exactly 2.0 at
 # derived-index >= 14, hand-computable exactly like the 5m case.

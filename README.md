@@ -21,11 +21,17 @@ lab/
   sim.py          Deterministic truth core — defines net_R, labels, outcomes.
                   Reference engine (scalar, hand-verifiable). Nothing else computes money.
   indicators.py   Pure, causal research primitives. Never imported by sim.py.
+  data.py         Market truth — bar contract, gap detection, OHLC validation, hashing.
+  observe.py      Phase 3 outcome-geometry measurement. Reads sim.py; decides nothing.
   tests/          Verification. Every claim is a test.
 tools/
   snapshot.py     Only file touching network/disk/wall-clock: build, load, observe.
+  tests/          Verification for tools/.
+cosmic-ray.toml   Mutation gate for lab/sim.py (RULES §17) — verify command in the
+                  file header. Every touch to sim.py needs a clean run before the
+                  simulation-authority tag moves.
 salvage/          Quarantine for code copied from v7-engine, UNAUDITED — see
-                  RULES.md §2. Currently empty; nothing has entered quarantine yet.
+                  RULES.md §2. Not present on disk; nothing has entered quarantine yet.
 ```
 
 ## Status
