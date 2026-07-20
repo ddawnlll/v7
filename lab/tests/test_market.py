@@ -46,7 +46,7 @@ def test_to_bars_empty_input():
 # --- to_bars: rejection branches (each names the offending index) -------------
 
 def test_to_bars_rejects_wrong_field_count():
-    with pytest.raises(ValueError, match=r"record\[0\]: expected 6 fields"):
+    with pytest.raises(ValueError, match=r"record\[0\]: expected 6 or 10 fields"):
         tape.to_bars([(0, 100.0, 101.0, 99.0, 100.0)], I)
 
 
@@ -342,3 +342,166 @@ def test_empty_tapes_hash_to_header_only():
     # All three empty-tape hashes agree (identical canonical bytes) — expected,
     # not a collision: same header, zero records, nothing to distinguish.
     assert tape.trade_tape_hash([]) == tape.mark_tape_hash([]) == tape.funding_tape_hash([])
+
+
+# --- extended (order-flow) tapes ----------------------------------------------
+
+def _trade_ext(n: int, start: float = 100.0):
+    """Extended records whose flow fields satisfy the containment invariants:
+    quote volume is priced at the bar's midpoint, taker buys are 60% of volume."""
+    out = []
+    for k in range(n):
+        low, high = start + k - 1.0, start + k + 1.0
+        mid = start + k + 0.5
+        volume = 10.0 + k
+        tbb = volume * 0.6
+        out.append((
+            k * I, start + k, high, low, mid, volume,
+            volume * mid, 100 + k, tbb, tbb * mid,
+        ))
+    return out
+
+
+def test_to_bars_parses_extended_records():
+    bars = tape.to_bars(_trade_ext(2), I)
+    assert bars[0].quote_volume == pytest.approx(10.0 * 100.5)
+    assert bars[0].trade_count == 100
+    assert bars[0].taker_buy_base_volume == pytest.approx(6.0)
+    assert bars[1].trade_count == 101
+
+
+def test_to_bars_rejects_mixed_width_tape():
+    records = _trade_ext(1) + _trade(2)[1:]
+    with pytest.raises(ValueError, match=r"record\[1\]: width 6 differs from 10"):
+        tape.to_bars(records, I)
+
+
+def test_to_bars_rejects_close_time_parsed_as_quote_volume():
+    """Regression: Binance kline column 6 is close_time, column 7 is quote
+    volume. Parsing 6 as quote volume put a timestamp in the field and nothing
+    caught it, because flow fields were neither validated nor hashed. The
+    containment bound rejects it by orders of magnitude."""
+    ts, close_time = 1689866400000, 1689866699999.0
+    rec = (ts, 29805.8, 29824.5, 29771.4, 29822.7, 1450.864,
+           close_time, 14054, 824.24, 24562734.1732)
+    with pytest.raises(ValueError, match=r"record\[0\]: quote_volume .* outside"):
+        tape.to_bars([rec], I)
+
+
+def test_to_bars_accepts_the_corrected_quote_volume():
+    """Same bar with column 7 — the true quote volume — passes."""
+    ts = 1689866400000
+    rec = (ts, 29805.8, 29824.5, 29771.4, 29822.7, 1450.864,
+           43_248_000.0, 14054, 824.24, 24562734.1732)
+    bars = tape.to_bars([rec], I)
+    assert bars[0].quote_volume == 43_248_000.0
+
+
+def test_to_bars_rejects_taker_buy_exceeding_volume():
+    rec = list(_trade_ext(1)[0])
+    rec[8] = rec[5] * 1.5
+    with pytest.raises(ValueError, match=r"record\[0\]: taker_buy_base_volume"):
+        tape.to_bars([tuple(rec)], I)
+
+
+def test_to_bars_rejects_quote_volume_without_base_volume():
+    rec = (0, 100.0, 101.0, 99.0, 100.0, 0.0, 5.0, 0, 0.0, 0.0)
+    with pytest.raises(ValueError, match=r"quote_volume 5.0 must be 0"):
+        tape.to_bars([rec], I)
+
+
+def test_to_bars_rejects_non_int_trade_count():
+    rec = list(_trade_ext(1)[0])
+    rec[7] = 100.5
+    with pytest.raises(TypeError, match=r"record\[0\]: trade_count must be an int"):
+        tape.to_bars([tuple(rec)], I)
+
+
+def test_extended_canonical_bytes_marks_header_and_carries_flow():
+    bars = tape.to_bars(_trade_ext(1), I)
+    raw = tape.canonical_bytes(bars)
+    assert raw.startswith(b"market-v0 extended\n")
+    assert raw.split(b"\n")[1].split(b" ") == [
+        b"0", b"100.0", b"101.0", b"99.0", b"100.5", b"10.0",
+        b"1005.0", b"100", b"6.0", b"603.0",
+    ]
+
+
+def test_extended_tape_never_collides_with_base_tape():
+    """Same OHLCV, different tape identity — the header alone guarantees it."""
+    ext = tape.to_bars(_trade_ext(2), I)
+    base = tape.to_bars([r[:6] for r in _trade_ext(2)], I)
+    assert tape.trade_tape_hash(ext) != tape.trade_tape_hash(base)
+
+
+def test_flow_field_corruption_changes_the_tape_hash():
+    """The point of hashing flow fields: silently altering one is detectable."""
+    bars = tape.to_bars(_trade_ext(2), I)
+    h1 = tape.trade_tape_hash(bars)
+    records = [list(r) for r in _trade_ext(2)]
+    records[0][7] += 1  # one extra trade in the count
+    assert tape.trade_tape_hash(tape.to_bars([tuple(r) for r in records], I)) != h1
+
+
+def test_canonical_bytes_rejects_partially_populated_bar():
+    bars = [
+        tape.Bar(0, 100.0, 101.0, 99.0, 100.5, 10.0, quote_volume=1005.0),
+    ]
+    with pytest.raises(ValueError, match=r"bar\[0\]: extended tape with a partially"):
+        tape.canonical_bytes(bars)
+
+
+def test_canonical_bytes_rejects_mixed_tape():
+    bars = tape.to_bars(_trade_ext(1), I) + tape.to_bars([_trade(2)[1]], I)
+    with pytest.raises(ValueError, match="mixed tape"):
+        tape.canonical_bytes(bars)
+
+
+def test_aggregate_sums_flow_fields():
+    bars = tape.to_bars(_trade_ext(4), I)
+    agg = tape.aggregate(bars, 2, I)
+    assert len(agg) == 2
+    assert agg[0].volume == pytest.approx(10.0 + 11.0)
+    assert agg[0].quote_volume == pytest.approx(10.0 * 100.5 + 11.0 * 101.5)
+    assert agg[0].trade_count == 100 + 101
+    assert agg[0].taker_buy_base_volume == pytest.approx(6.0 + 6.6)
+
+
+def test_aggregate_leaves_base_tape_flow_unset():
+    agg = tape.aggregate(tape.to_bars(_trade(4), I), 2, I)
+    assert agg[0].quote_volume is None
+    assert agg[0].trade_count is None
+
+
+# --- flow_violation: the reporting face of the same rule ----------------------
+
+def test_flow_violation_none_for_a_sound_bar():
+    _, _, high, low, _, volume, qv, _, tbb, tbq = _trade_ext(1)[0]
+    assert tape.flow_violation(volume, low, high, qv, tbb, tbq) is None
+
+
+def test_flow_violation_names_the_broken_invariant():
+    reason = tape.flow_violation(37811.0, 5.335, 5.356, 963232.0673, 104350.4, 558032.054)
+    assert reason is not None
+    assert "taker_buy_base_volume" in reason and "exceeds volume" in reason
+
+
+def test_flow_violation_and_to_bars_agree():
+    """Single authority (RULES §4): every bar ``flow_violation`` flags is a bar
+    ``to_bars`` refuses, and every bar it clears is one ``to_bars`` accepts."""
+    ok = _trade_ext(1)[0]
+    cases = [ok]
+    for pos, value in ((6, 1689866699999.0), (8, 999.0), (9, 1e12), (6, float("nan"))):
+        bad = list(ok)
+        bad[pos] = value
+        cases.append(tuple(bad))
+
+    for rec in cases:
+        _, _, high, low, _, volume, qv, _, tbb, tbq = rec
+        flagged = tape.flow_violation(volume, low, high, qv, tbb, tbq) is not None
+        try:
+            tape.to_bars([rec], I)
+            rejected = False
+        except ValueError:
+            rejected = True
+        assert flagged == rejected, f"disagreement on {rec}"

@@ -245,7 +245,7 @@ def process_klines(rows: list[list[str]], start_ts: int, end_ts: int) -> list[tu
                 float(r[3]),   # low
                 float(r[4]),   # close
                 float(r[5]),   # volume
-                float(r[6]),   # quote_volume
+                float(r[7]),   # quote_volume (r[6] is close_time)
                 int(r[8]),     # trade_count
                 float(r[9]),   # taker_buy_base_volume
                 float(r[10]),  # taker_buy_quote_volume
@@ -286,9 +286,9 @@ def process_funding(rows: list[list[str]], start_ts: int, end_ts: int) -> list[t
     return records
 
 
-def validate_premium_bars(records: list[tuple], interval_ms: int) -> list[tape.MarkBar]:
+def validate_premium_bars(records: list[tuple], interval_ms: int) -> list[market.MarkBar]:
     """Validate premium index bars which can have negative prices since it is a spread."""
-    bars: list[tape.MarkBar] = []
+    bars: list[market.MarkBar] = []
     prev_ts = None
     for idx, rec in enumerate(records):
         ts, o, h, l, c = rec
@@ -301,7 +301,7 @@ def validate_premium_bars(records: list[tuple], interval_ms: int) -> list[tape.M
         if not (l <= min(o, c) and max(o, c) <= h):
             raise ValueError(f"premium[{idx}]: inconsistent OHLC (o={o}, h={h}, l={l}, c={c})")
         prev_ts = ts
-        bars.append(tape.MarkBar(ts, o, h, l, c))
+        bars.append(market.MarkBar(ts, o, h, l, c))
     return bars
 
 
@@ -361,6 +361,26 @@ def compile_tapes(sym: str, start_ts: int, end_ts: int, months: list, days: list
     premium_recs = sorted(list(set(premium_recs)), key=lambda x: x[0])
     funding_recs = sorted(list(set(funding_recs)), key=lambda x: x[0])
 
+    # Drop bars whose order-flow fields are economically impossible. This is the
+    # dirty-cell branch of RULES §1: a single corrupt observation must not crash
+    # the build, so the bar leaves the tape entirely and reappears as a gap in
+    # the detection below — never repaired. The true volume *is* recoverable
+    # from the taker fields, and recovering it would be synthetic data (§1).
+    flow_rejected = []
+    kept = []
+    for rec in trade_recs:
+        reason = market.flow_violation(rec[5], rec[3], rec[2], rec[6], rec[8], rec[9])
+        if reason is None:
+            kept.append(rec)
+        else:
+            flow_rejected.append({"open_ts": rec[0], "reason": reason})
+    if flow_rejected:
+        print(
+            f"  [DROP] {sym}: {len(flow_rejected)} bar(s) with impossible order "
+            f"flow removed, recorded as gaps"
+        )
+    trade_recs = kept
+
     # Construct math master grid of timestamps
     expected_bars = (end_ts - start_ts) // 300_000
     master_grid = [start_ts + i * 300_000 for i in range(expected_bars)]
@@ -372,20 +392,21 @@ def compile_tapes(sym: str, start_ts: int, end_ts: int, months: list, days: list
     premium_gaps = _detect_gaps(premium_recs, master_grid, "premium")
     all_gaps = {"trade": trade_gaps, "mark": mark_gaps, "index": index_gaps, "premium": premium_gaps}
 
-    # Core Validation via lab/market (formerly lab/tape)
-    trade_to_verify = [x[:6] for x in trade_recs]
-    validated_trade_bars = tape.to_bars(trade_to_verify, 300_000)
-    validated_mark_bars = tape.to_mark_bars(mark_recs, 300_000)
-    validated_index_bars = tape.to_mark_bars(index_recs, 300_000)
+    # Core Validation via lab/market (formerly lab/tape). Full 10-field records:
+    # the order-flow columns are validated and hashed with the rest of the tape,
+    # not written to Parquet on trust.
+    validated_trade_bars = market.to_bars(trade_recs, 300_000)
+    validated_mark_bars = market.to_mark_bars(mark_recs, 300_000)
+    validated_index_bars = market.to_mark_bars(index_recs, 300_000)
     validated_premium_bars = validate_premium_bars(premium_recs, 300_000)
-    validated_funding_recs = [tape.FundingRecord(funding_time=x[0], rate=x[1]) for x in funding_recs]
+    validated_funding_recs = [market.FundingRecord(funding_time=x[0], rate=x[1]) for x in funding_recs]
 
     # Deriving Dataset hashes
-    trade_hash = tape.trade_tape_hash(validated_trade_bars)
-    mark_hash = tape.mark_tape_hash(validated_mark_bars)
-    index_hash = tape.mark_tape_hash(validated_index_bars)
-    premium_hash = tape.mark_tape_hash(validated_premium_bars)
-    funding_hash = tape.funding_tape_hash(validated_funding_recs)
+    trade_hash = market.trade_tape_hash(validated_trade_bars)
+    mark_hash = market.mark_tape_hash(validated_mark_bars)
+    index_hash = market.mark_tape_hash(validated_index_bars)
+    premium_hash = market.mark_tape_hash(validated_premium_bars)
+    funding_hash = market.funding_tape_hash(validated_funding_recs)
 
     # Save to staging
     staging_dir = out_dir / f".build-{sym}"
@@ -442,6 +463,10 @@ def compile_tapes(sym: str, start_ts: int, end_ts: int, months: list, days: list
             "coverage_complete": len(trade_recs) == expected_bars,
             "gap_count": len(trade_gaps),
             "gaps": trade_gaps[:100],  # first 100, don't bloat manifest
+            # Bars the exchange published with impossible order flow. They are
+            # part of gap_count above; named here so the hole is attributable.
+            "flow_rejected_count": len(flow_rejected),
+            "flow_rejected": flow_rejected[:100],
         },
         "mark": {
             "dataset_hash": mark_hash,

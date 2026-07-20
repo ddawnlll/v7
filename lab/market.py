@@ -176,17 +176,114 @@ def _check_ts_ohlc(
     return ts
 
 
+# Relative slack for the quote-volume containment bounds below. The bounds are
+# exact in real arithmetic; this only absorbs the exchange's own rounding of
+# ``volume`` and ``quote_volume`` to fixed decimal places.
+_FLOW_REL_TOL = 1e-6
+
+
+def flow_violation(
+    volume: float, low: float, high: float,
+    quote_volume: float, taker_buy_base: float, taker_buy_quote: float,
+) -> str | None:
+    """Describe the first order-flow invariant this bar violates, or ``None``.
+
+    The invariants are identities, not heuristics: quote volume is
+    ``sum(price * qty)`` over the bar's trades and every price lies in
+    ``[low, high]``, so
+
+        volume * low <= quote_volume <= volume * high
+
+    and the same holds for the taker-buy subset against its own base volume,
+    which is itself a subset of volume. A field parsed from the wrong CSV
+    column (a timestamp, say) breaks these by orders of magnitude.
+
+    This is the single authority for what makes flow fields economically
+    impossible (RULES §4). It reports rather than raises so a *builder* can
+    apply the dirty-cell policy of RULES §1 — drop the bar and let it surface
+    as a gap — while ``to_bars`` keeps its strict, no-silent-repair contract.
+    """
+    for name, x in (
+        ("quote_volume", quote_volume),
+        ("taker_buy_base_volume", taker_buy_base),
+        ("taker_buy_quote_volume", taker_buy_quote),
+    ):
+        if not _finite(x) or x < 0.0:
+            return f"{name} {x} must be finite and >= 0"
+
+    if taker_buy_base > volume * (1.0 + _FLOW_REL_TOL):
+        return f"taker_buy_base_volume {taker_buy_base} exceeds volume {volume}"
+
+    return (
+        _containment_violation(quote_volume, volume, low, high, "quote_volume")
+        or _containment_violation(
+            taker_buy_quote, taker_buy_base, low, high, "taker_buy_quote_volume"
+        )
+    )
+
+
+def _containment_violation(
+    quote: float, base: float, low: float, high: float, name: str,
+) -> str | None:
+    """``base * low <= quote <= base * high`` within rounding slack. With no
+    base volume there are no trades, so the quote side must be zero."""
+    if base == 0.0:
+        if quote != 0.0:
+            return f"{name} {quote} must be 0 when its base volume is 0"
+        return None
+    lo, hi = base * low, base * high
+    tol = _FLOW_REL_TOL * max(abs(hi), 1.0)
+    if not (lo - tol <= quote <= hi + tol):
+        return (
+            f"{name} {quote} outside [{lo}, {hi}] implied by base volume "
+            f"{base} and price range [{low}, {high}]"
+        )
+    return None
+
+
+def _check_flow(
+    qv: object, tc: object, tbb: object, tbq: object,
+    volume: float, low: float, high: float, idx: int,
+) -> tuple[float, int, float, float]:
+    """Fail-closed gate for one bar's order-flow fields. Type errors mean a
+    broken parser and raise on their own; everything else defers to
+    ``flow_violation``. Returns the validated fields."""
+    if isinstance(tc, bool) or not isinstance(tc, int):
+        raise TypeError(f"record[{idx}]: trade_count must be an int")
+    if tc < 0:
+        raise ValueError(f"record[{idx}]: trade_count {tc} must be >= 0")
+    for name, x in (
+        ("quote_volume", qv), ("taker_buy_base_volume", tbb),
+        ("taker_buy_quote_volume", tbq),
+    ):
+        if not isinstance(x, (int, float)) or isinstance(x, bool):
+            raise TypeError(f"record[{idx}]: {name} must be a number")
+
+    qv, tbb, tbq = float(qv), float(tbb), float(tbq)
+    reason = flow_violation(volume, low, high, qv, tbb, tbq)
+    if reason is not None:
+        raise ValueError(f"record[{idx}]: {reason}")
+    return qv, tc, tbb, tbq
+
+
 # --- raw records -> validated bars -------------------------------------------
 
 def to_bars(records: Sequence[Sequence[float]], interval_ms: int) -> list[Bar]:
     """Parse and structurally validate raw trade-candle records, fail-closed.
 
-    Each record is ``(open_ts, open, high, low, close, volume)``. Every record
-    must have an integer ``open_ts`` aligned to the interval grid, finite and
-    OHLC-consistent prices, and a finite non-negative volume. Across the
-    sequence, ``open_ts`` must be strictly increasing (this rejects duplicates
-    and out-of-order candles). Any violation raises ``ValueError``/``TypeError``
-    naming the offending index — no record is silently dropped or repaired.
+    Each record is either the base form ``(open_ts, open, high, low, close,
+    volume)`` or the extended form, which appends ``(quote_volume, trade_count,
+    taker_buy_base_volume, taker_buy_quote_volume)``. Every record must have an
+    integer ``open_ts`` aligned to the interval grid, finite and OHLC-consistent
+    prices, and a finite non-negative volume. Across the sequence, ``open_ts``
+    must be strictly increasing (this rejects duplicates and out-of-order
+    candles). Any violation raises ``ValueError``/``TypeError`` naming the
+    offending index — no record is silently dropped or repaired.
+
+    Record width must be uniform across the sequence: a tape is either wholly
+    base or wholly extended. A mixed tape is a structural error, because a bar
+    silently missing its flow fields would otherwise hash as if the exchange
+    never reported them.
 
     Returns the validated bars in input order. Detecting *missing* candles is a
     separate, non-raising concern (``detect_gaps``): a hole in the tape is data
@@ -195,15 +292,36 @@ def to_bars(records: Sequence[Sequence[float]], interval_ms: int) -> list[Bar]:
     _check_interval(interval_ms)
     bars: list[Bar] = []
     prev_ts: int | None = None
+    width: int | None = None
     for idx, rec in enumerate(records):
-        if len(rec) != 6:
-            raise ValueError(f"record[{idx}]: expected 6 fields, got {len(rec)}")
-        ts, o, h, l, c, v = rec
+        if len(rec) not in (6, 10):
+            raise ValueError(
+                f"record[{idx}]: expected 6 or 10 fields, got {len(rec)}"
+            )
+        if width is None:
+            width = len(rec)
+        elif len(rec) != width:
+            raise ValueError(
+                f"record[{idx}]: width {len(rec)} differs from {width} earlier "
+                f"in the tape — a tape is wholly base or wholly extended"
+            )
+        ts, o, h, l, c, v = rec[:6]
         ts = _check_ts_ohlc(ts, o, h, l, c, prev_ts, idx, interval_ms)
         if not _finite(v) or v < 0.0:
             raise ValueError(f"record[{idx}]: volume {v} must be finite and >= 0")
+        v = float(v)
         prev_ts = ts
-        bars.append(Bar(ts, float(o), float(h), float(l), float(c), float(v)))
+        if width == 6:
+            bars.append(Bar(ts, float(o), float(h), float(l), float(c), v))
+            continue
+        qv, tc, tbb, tbq = _check_flow(
+            rec[6], rec[7], rec[8], rec[9], v, float(l), float(h), idx
+        )
+        bars.append(Bar(
+            ts, float(o), float(h), float(l), float(c), v,
+            quote_volume=qv, trade_count=tc,
+            taker_buy_base_volume=tbb, taker_buy_quote_volume=tbq,
+        ))
     return bars
 
 
@@ -304,6 +422,11 @@ def aggregate(bars: Sequence[Bar], factor: int, interval_ms: int) -> list[Bar]:
     bar's open, close the last bar's close, high/low the extremes, volume the
     (compensated) sum.
 
+    Order-flow fields, when the tape carries them, are additive over the bucket
+    exactly as volume is, and are carried through — an aggregated bar that
+    dropped them would silently hand a 1h consumer a bar the exchange never
+    reported flow for.
+
     ``bars`` must be ``to_bars`` output (aligned, strictly increasing).
     """
     _check_interval(interval_ms)
@@ -312,6 +435,7 @@ def aggregate(bars: Sequence[Bar], factor: int, interval_ms: int) -> list[Bar]:
     if factor < 2:
         raise ValueError(f"factor must be >= 2, got {factor}")
 
+    extended = _tape_is_extended(bars)
     higher = interval_ms * factor
     result: list[Bar] = []
     n = len(bars)
@@ -325,6 +449,18 @@ def aggregate(bars: Sequence[Bar], factor: int, interval_ms: int) -> list[Bar]:
                 break
             window.append(bars[j])
         if len(window) == factor:
+            flow: dict[str, float | int] = {}
+            if extended:
+                flow = {
+                    "quote_volume": math.fsum(b.quote_volume for b in window),
+                    "trade_count": sum(b.trade_count for b in window),
+                    "taker_buy_base_volume": math.fsum(
+                        b.taker_buy_base_volume for b in window
+                    ),
+                    "taker_buy_quote_volume": math.fsum(
+                        b.taker_buy_quote_volume for b in window
+                    ),
+                }
             result.append(Bar(
                 open_ts=bucket_start,
                 open=window[0].open,
@@ -332,6 +468,7 @@ def aggregate(bars: Sequence[Bar], factor: int, interval_ms: int) -> list[Bar]:
                 low=min(b.low for b in window),
                 close=window[-1].close,
                 volume=math.fsum(b.volume for b in window),
+                **flow,
             ))
             i += factor
         else:
@@ -348,6 +485,35 @@ def _sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _tape_is_extended(bars: Sequence[Bar]) -> bool:
+    """True if the tape carries order-flow fields, False if none do.
+
+    All-or-nothing: a tape where only some bars carry flow fields raises. This
+    mirrors the uniform-width contract in ``to_bars`` and keeps the tape
+    identity unambiguous — see ``canonical_bytes``.
+    """
+    flagged = [
+        b.quote_volume is not None or b.trade_count is not None
+        or b.taker_buy_base_volume is not None
+        or b.taker_buy_quote_volume is not None
+        for b in bars
+    ]
+    if not flagged or not any(flagged):
+        return False
+    if not all(flagged):
+        raise ValueError(
+            "mixed tape: some bars carry order-flow fields and some do not"
+        )
+    for i, b in enumerate(bars):
+        if (b.quote_volume is None or b.trade_count is None
+                or b.taker_buy_base_volume is None
+                or b.taker_buy_quote_volume is None):
+            raise ValueError(
+                f"bar[{i}]: extended tape with a partially populated bar"
+            )
+    return True
+
+
 def canonical_bytes(bars: Sequence[Bar]) -> bytes:
     """Deterministic, round-tripping serialization of the trade tape.
 
@@ -355,12 +521,26 @@ def canonical_bytes(bars: Sequence[Bar]) -> bytes:
     which since CPython 3.1 is the shortest string that round-trips to the exact
     value and is stable across platforms — so identical bars hash identically
     everywhere, and a human can read the file and check a candle by hand.
+
+    A tape carrying order-flow fields serializes them too, and says so in its
+    header. Two consequences, both deliberate: the flow fields are inside the
+    tape identity (silently corrupting one changes the hash), and a base tape
+    can never collide with an extended tape that happens to share its OHLCV.
+    A base tape's bytes are unchanged from ``market-v0``, so hashes recorded
+    before flow fields existed stay valid.
     """
-    lines = [SCHEMA_VERSION]
+    extended = _tape_is_extended(bars)
+    lines = [f"{SCHEMA_VERSION} extended" if extended else SCHEMA_VERSION]
     for b in bars:
-        lines.append(
+        line = (
             f"{b.open_ts} {b.open!r} {b.high!r} {b.low!r} {b.close!r} {b.volume!r}"
         )
+        if extended:
+            line += (
+                f" {b.quote_volume!r} {b.trade_count!r} "
+                f"{b.taker_buy_base_volume!r} {b.taker_buy_quote_volume!r}"
+            )
+        lines.append(line)
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
