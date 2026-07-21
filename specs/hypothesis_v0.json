@@ -1,0 +1,43 @@
+{
+  "spec_version": "hypothesis-v0",
+  "status": "ACTIVE",
+  "hypothesis_id": "H1",
+  "title": "Directional momentum alignment",
+  "statement": "When both short-term (5m) and medium-term (1h) directional returns are positive in sign-flipped feature space (aligned with the candidate event side), the event achieves higher mean net_R than random selection on untouched out-of-sample data.",
+  "feature_surface": {
+    "spec": "specs/feature_candidate_v0.json",
+    "used_features": ["return_5m", "return_1h"],
+    "available_features": ["return_5m", "return_15m", "return_1h", "atr_pct"]
+  },
+  "decision_rule": {
+    "type": "threshold_and",
+    "description": "TAKE when return_5m > 0 AND return_1h > 0, ABSTAIN otherwise. Both features are sign-flipped for SHORT events so positive always means aligned with event direction.",
+    "implementation": "lab.evaluate.make_momentum_alignment_predictor"
+  },
+  "falsification": {
+    "criterion": "H1 mean_net_r on frozen test split is not greater than zero AND not greater than always-take baseline mean_net_r",
+    "pass": "H1 test mean_net_r > 0 AND H1 test mean_net_r > always-take test mean_net_r",
+    "fail": "H1 test mean_net_r <= 0 AND H1 test mean_net_r <= always-take test mean_net_r",
+    "hold": "insufficient evidence (e.g. zero trades taken, or positive but ambiguous vs baselines)"
+  },
+  "baseline_ladder": [
+    "abstain (floor)",
+    "always_take (raw expectancy)",
+    "random (convergence to ~0)",
+    "linear OLS with intercept",
+    "regression tree (CART, max_depth=3, min_samples_leaf=20)"
+  ],
+  "negative_controls": [
+    "shuffled-label: re-fit linear OLS on shuffled train labels, evaluate on frozen test — 10 shuffles"
+  ],
+  "data": {
+    "source": "Phase 4 pilot universe (OKX, 10 symbols, early profile, 3 years)",
+    "window": "[1689866400000, 1784474400000)",
+    "setup": "HunterSpec V0: k_stop=2.0, reward_risk=3.0, 1h decision on 5m sim",
+    "split": "chronological, boundary=2025-10-20T00:00:00Z, outcome-end purged"
+  },
+  "verdict": null,
+  "verdict_date": null,
+  "evidence_sha": null,
+  "declared_at": "2026-07-21"
+}

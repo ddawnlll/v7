@@ -1,6 +1,6 @@
 {
   "spec_version": "feature-candidate-v0",
-  "status": "CANDIDATE",
+  "status": "PROMOTED",
   "description": "Directional momentum + volatility feature surface for Phase 6 hypothesis testing",
   "feature_names": ["return_5m", "return_15m", "return_1h", "atr_pct"],
   "feature_dim": 4,

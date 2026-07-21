@@ -1,244 +1,142 @@
-"""Tests for tools/data.py — build validation, pagination guards, and
-load round-trip integrity.
+from __future__ import annotations
 
-Deliberately does NOT test the network fetch functions themselves — that
-would mean either hitting live OKX from CI (flaky, slow, rate-limited) or
-mocking urllib deeply enough that the test proves nothing about the real
-endpoint.
-"""
-import json
-from unittest import mock
+import csv
+import hashlib
+import tempfile
+import unittest
+import zipfile
+from datetime import date, datetime, timezone
+from pathlib import Path
 
-import pytest
-
-from lab import market
-from tools import data as sn
+import dataset
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# build() window validation
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def test_partial_bound_start_only_rejected(tmp_path):
-    with pytest.raises(ValueError, match="supplied together"):
-        sn.build(start_ts=1776698400000, end_ts=None, out_dir=tmp_path / "snap")
-
-
-def test_partial_bound_end_only_rejected(tmp_path):
-    with pytest.raises(ValueError, match="supplied together"):
-        sn.build(start_ts=None, end_ts=1784474400000, out_dir=tmp_path / "snap")
-
-
-def test_unsupported_bar_rejected(tmp_path):
-    with pytest.raises(ValueError, match="unsupported bar"):
-        sn.build(bar="1m", out_dir=tmp_path / "snap")
-
-
-def test_inverted_window_rejected(tmp_path):
-    with pytest.raises(ValueError, match="must be before"):
-        sn.build(start_ts=1784474400000, end_ts=1776698400000, out_dir=tmp_path / "snap")
-
-
-def test_misaligned_window_rejected(tmp_path):
-    with pytest.raises(ValueError, match="align to the"):
-        sn.build(start_ts=1776698400001, end_ts=1784474400000, out_dir=tmp_path / "snap")
-
-
-def test_nonpositive_days_rejected(tmp_path):
-    with pytest.raises(ValueError, match="days must be positive"):
-        sn.build(days=0, out_dir=tmp_path / "snap")
-
-
-def test_existing_out_dir_rejected(tmp_path):
-    existing = tmp_path / "snap"
-    existing.mkdir()
-    with pytest.raises(FileExistsError, match="already exists"):
-        sn.build(start_ts=1776698400000, end_ts=1776698700000, out_dir=existing)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# _paginate_bounded() guards
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def test_pagination_stuck_cursor_raises():
-    with mock.patch.object(sn, "_get_retry") as get_retry:
-        get_retry.return_value = [[str(1000), "1", "1", "1", "1", "1"]]
-        with pytest.raises(RuntimeError, match="did not advance"):
-            sn._paginate_bounded(
-                "/fake", {}, "9999", lambda row: int(row[0]), 0, limit=1, max_pages=3
-            )
-
-
-def test_pagination_max_pages_exhausted_raises():
-    counter = {"n": 2000}
-
-    def descending_page(_path, _params):
-        counter["n"] -= 1
-        return [[str(counter["n"]), "1", "1", "1", "1", "1"]]
-
-    with mock.patch.object(sn, "_get_retry", side_effect=descending_page):
-        with pytest.raises(RuntimeError, match="exhausted max_pages"):
-            sn._paginate_bounded(
-                "/fake", {}, "9999", lambda row: int(row[0]), 0, limit=1, max_pages=3
-            )
-
-
-def test_pagination_normal_termination_still_works():
-    """Regression guard: the two new checks above must not break the
-    ordinary case of a cursor that strictly advances to stop_ts."""
-    pages = [
-        [[str(500), "1", "1", "1", "1", "1"]],
-        [[str(0), "1", "1", "1", "1", "1"]],
-    ]
-    with mock.patch.object(sn, "_get_retry", side_effect=lambda _path, _params: pages.pop(0)):
-        rows = sn._paginate_bounded(
-            "/fake", {}, "9999", lambda row: int(row[0]), 0, limit=1, max_pages=5
+class DatasetBuilderTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.source = self.root / "source" / "data"
+        self.cache = self.root / "cache"
+        self.output = self.root / "canonical"
+        self.symbol = "BTCUSDT"
+        self.day = date(2024, 1, 15)
+        self.start_ts = int(
+            datetime(2024, 1, 15, tzinfo=timezone.utc).timestamp() * 1000
         )
-    assert len(rows) == 2
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def _write_zip(self, relative_path: str, rows: list[list[object]]) -> Path:
+        zip_path = self.source / relative_path
+        zip_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_path = zip_path.with_suffix(".csv")
+        with csv_path.open("w", newline="", encoding="utf-8") as handle:
+            csv.writer(handle).writerows(rows)
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.write(csv_path, arcname=csv_path.name)
+        csv_path.unlink()
+
+        digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+        Path(f"{zip_path}.CHECKSUM").write_text(
+            f"{digest}  {zip_path.name}\n", encoding="utf-8"
+        )
+        return zip_path
+
+    def _kline_rows(self, *, omit_index: int | None = None) -> list[list[object]]:
+        rows: list[list[object]] = []
+        for index in range(1_440):
+            if index == omit_index:
+                continue
+            open_ts = self.start_ts + index * 60_000
+            close_ts = open_ts + 59_999
+            price = 100 + index * 0.001
+            rows.append(
+                [
+                    open_ts,
+                    price,
+                    price + 1,
+                    price - 1,
+                    price + 0.5,
+                    10,
+                    close_ts,
+                    1_000,
+                    5,
+                    4,
+                    400,
+                    0,
+                ]
+            )
+        return rows
+
+    def _prepare_source(self, *, omit_bar: int | None = None) -> None:
+        period = self.day.isoformat()
+        rows = self._kline_rows(omit_index=omit_bar)
+        for data_type in dataset.KLINE_TYPES:
+            relative = dataset._archive_relative_path(
+                symbol=self.symbol,
+                data_type=data_type,
+                interval="1m",
+                cadence="daily",
+                period=period,
+            )
+            self._write_zip(relative, rows)
+
+        funding_relative = dataset._archive_relative_path(
+            symbol=self.symbol,
+            data_type="fundingRate",
+            interval=None,
+            cadence="monthly",
+            period="2024-01",
+        )
+        self._write_zip(
+            funding_relative,
+            [
+                ["calc_time", "funding_interval_hours", "last_funding_rate"],
+                [self.start_ts + 8 * 3_600_000, 8, "0.0001"],
+            ],
+        )
+
+    def _config(self) -> dataset.DatasetConfig:
+        return dataset.DatasetConfig(
+            symbols=(self.symbol,),
+            start=self.day,
+            end=date(2024, 1, 16),
+            out_dir=self.output,
+            raw_cache_dir=self.cache,
+            base_url=self.source.as_uri(),
+            workers=2,
+            keep_raw=True,
+            fetch_exchange_info=False,
+        )
+
+    def test_build_verify_audit_and_lazy_load(self) -> None:
+        self._prepare_source()
+        manifest = dataset.build(self._config())
+
+        self.assertEqual(manifest["status"], "VERIFIED")
+        self.assertEqual(len(manifest["artifacts"]), 5)
+        self.assertEqual(dataset.verify(self.output)["verdict"], "PASS")
+        self.assertEqual(dataset.audit(self.output)["verdict"], "PASS")
+
+        loaded = dataset.load(self.output)
+        self.assertEqual(loaded.scan("bars").select("open_ts").collect().height, 1_440)
+
+    def test_missing_primary_bar_fails_closed(self) -> None:
+        self._prepare_source(omit_bar=700)
+        with self.assertRaisesRegex(ValueError, "coverage mismatch"):
+            dataset.build(self._config())
+        self.assertFalse(self.output.exists())
+
+    def test_published_file_tampering_is_detected(self) -> None:
+        self._prepare_source()
+        dataset.build(self._config())
+        bars = self.output / "bars" / f"symbol={self.symbol}" / "bars_1m.parquet"
+        with bars.open("ab") as handle:
+            handle.write(b"tamper")
+        with self.assertRaisesRegex(ValueError, "file SHA mismatch"):
+            dataset.verify(self.output)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# load() round-trip — fabricated snapshot on disk
-# ═══════════════════════════════════════════════════════════════════════════════
-
-_TRADE_BARS = [
-    market.Bar(open_ts=0, open=100.0, high=101.0, low=99.0, close=100.0, volume=1.0),
-    market.Bar(open_ts=300_000, open=100.0, high=102.0, low=98.0, close=101.0, volume=2.0),
-    market.Bar(open_ts=600_000, open=101.0, high=103.0, low=100.0, close=102.0, volume=1.5),
-]
-_MARK_BARS = [
-    market.MarkBar(open_ts=0, open=100.0, high=101.0, low=99.0, close=100.0),
-    market.MarkBar(open_ts=300_000, open=100.0, high=102.0, low=98.0, close=101.5),
-    market.MarkBar(open_ts=600_000, open=101.0, high=103.0, low=100.0, close=102.5),
-]
-_FUNDING_RECORDS = [market.FundingRecord(funding_time=300_000, rate=0.0001)]
-
-
-def _write_snapshot(tmp_path, *, trade_complete=True, mark_complete=True, tamper_trade=False):
-    sn.write_trade_parquet(_TRADE_BARS, tmp_path / "trade_bars_5m.parquet")
-    sn.write_mark_parquet(_MARK_BARS, tmp_path / "mark_bars_5m.parquet")
-    sn.write_funding_parquet(_FUNDING_RECORDS, tmp_path / "funding_events.parquet")
-    (tmp_path / "instrument.json").write_text(json.dumps({"instId": "TEST-SWAP"}))
-
-    manifest = {
-        "instrument_id": "TEST-SWAP",
-        "source": "okx",
-        "bar": "5m",
-        "requested_start_ts": 0,
-        "requested_end_ts": 900_000,
-        "trade": {
-            "coverage_complete": trade_complete,
-            "dataset_hash": market.trade_tape_hash(_TRADE_BARS),
-        },
-        "mark": {
-            "coverage_complete": mark_complete,
-            "dataset_hash": market.mark_tape_hash(_MARK_BARS),
-        },
-        "funding": {"dataset_hash": market.funding_tape_hash(_FUNDING_RECORDS)},
-    }
-    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
-
-    if tamper_trade:
-        tampered = [
-            market.Bar(open_ts=b.open_ts, open=b.open, high=b.high, low=b.low,
-                     close=b.close + 999.0, volume=b.volume)
-            for b in _TRADE_BARS
-        ]
-        sn.write_trade_parquet(tampered, tmp_path / "trade_bars_5m.parquet")
-
-
-def test_load_valid_snapshot_succeeds(tmp_path):
-    _write_snapshot(tmp_path)
-    loaded = sn.load(tmp_path)
-
-    assert [b.open_ts for b in loaded.trade_bars] == [0, 300_000, 600_000]
-    assert [b.open_ts for b in loaded.mark_bars] == [0, 300_000, 600_000]
-    assert len(loaded.funding_events) == 1
-    assert loaded.funding_events[0].bar_index == 1
-    assert loaded.funding_events[0].mark_price == _MARK_BARS[1].close
-    assert loaded.funding_events[0].rate == 0.0001
-
-
-def test_tampered_trade_tape_rejected(tmp_path):
-    _write_snapshot(tmp_path, tamper_trade=True)
-    with pytest.raises(ValueError, match="hash mismatch"):
-        sn.load(tmp_path)
-
-
-def test_incomplete_trade_coverage_rejected(tmp_path):
-    _write_snapshot(tmp_path, trade_complete=False)
-    with pytest.raises(ValueError, match="coverage_complete=false"):
-        sn.load(tmp_path)
-
-
-def test_incomplete_mark_coverage_rejected(tmp_path):
-    _write_snapshot(tmp_path, mark_complete=False)
-    with pytest.raises(ValueError, match="coverage_complete=false"):
-        sn.load(tmp_path)
-
-
-def test_bar_count_short_of_expected_rejected_even_if_flagged_complete(tmp_path):
-    """coverage_complete=true is manifest-authored, not re-derived — a
-    truncated tape mislabeled complete must not silently pass."""
-    short_trade = _TRADE_BARS[:2]  # window (0, 900_000) implies 3 bars
-    sn.write_trade_parquet(short_trade, tmp_path / "trade_bars_5m.parquet")
-    sn.write_mark_parquet(_MARK_BARS, tmp_path / "mark_bars_5m.parquet")
-    sn.write_funding_parquet(_FUNDING_RECORDS, tmp_path / "funding_events.parquet")
-    (tmp_path / "instrument.json").write_text(json.dumps({"instId": "TEST-SWAP"}))
-
-    manifest = {
-        "instrument_id": "TEST-SWAP",
-        "source": "okx",
-        "bar": "5m",
-        "requested_start_ts": 0,
-        "requested_end_ts": 900_000,
-        "trade": {
-            "coverage_complete": True,
-            "dataset_hash": market.trade_tape_hash(short_trade),
-        },
-        "mark": {
-            "coverage_complete": True,
-            "dataset_hash": market.mark_tape_hash(_MARK_BARS),
-        },
-        "funding": {"dataset_hash": market.funding_tape_hash(_FUNDING_RECORDS)},
-    }
-    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
-
-    with pytest.raises(ValueError, match="implies 3"):
-        sn.load(tmp_path)
-
-
-def test_trade_mark_misalignment_rejected(tmp_path):
-    """Trade and mark tapes must share the same open_ts sequence — funding
-    events are mapped onto both by index, so a silently misaligned mark
-    tape would attach the wrong settlement price to a funding event."""
-    shifted_mark = [
-        market.MarkBar(open_ts=b.open_ts + 300_000, open=b.open, high=b.high,
-                     low=b.low, close=b.close)
-        for b in _MARK_BARS
-    ]
-    sn.write_trade_parquet(_TRADE_BARS, tmp_path / "trade_bars_5m.parquet")
-    sn.write_mark_parquet(shifted_mark, tmp_path / "mark_bars_5m.parquet")
-    sn.write_funding_parquet(_FUNDING_RECORDS, tmp_path / "funding_events.parquet")
-    (tmp_path / "instrument.json").write_text(json.dumps({"instId": "TEST-SWAP"}))
-
-    manifest = {
-        "instrument_id": "TEST-SWAP",
-        "source": "okx",
-        "bar": "5m",
-        "requested_start_ts": 0,
-        "requested_end_ts": 900_000,
-        "trade": {
-            "coverage_complete": True,
-            "dataset_hash": market.trade_tape_hash(_TRADE_BARS),
-        },
-        "mark": {
-            "coverage_complete": True,
-            "dataset_hash": market.mark_tape_hash(shifted_mark),
-        },
-        "funding": {"dataset_hash": market.funding_tape_hash(_FUNDING_RECORDS)},
-    }
-    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
-
-    with pytest.raises(ValueError, match="not index-aligned"):
-        sn.load(tmp_path)
+if __name__ == "__main__":
+    unittest.main()

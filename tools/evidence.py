@@ -1,6 +1,6 @@
 """Evidence generator (ROADMAP Phase 6).
 
-Loads Binance pilot universe snapshots, builds candidate events with
+Loads OKX pilot universe snapshots, builds candidate events with
 HunterSpec V0, extracts directional features, and evaluates the declared
 market hypothesis against the baseline ladder on untouched OOS data.
 Produces a PASS / FAIL / HOLD verdict."""
@@ -66,12 +66,18 @@ HUNTER_SPEC = Setup(
 # Split boundary: 2025-10-20T00:00:00Z (specs/split_candidate_v0.json)
 SPLIT_TS = 1760918400000
 
+# 10-symbol OKX pilot universe from Phase 4 (tools/validate_phase4.py)
 PILOT_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "ADAUSDT",
-    "AVAXUSDT", "DOGEUSDT", "LINKUSDT", "NEARUSDT",
+    "BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP", "XRP-USDT-SWAP",
+    "ADA-USDT-SWAP", "AVAX-USDT-SWAP", "DOGE-USDT-SWAP", "LINK-USDT-SWAP",
+    "DOT-USDT-SWAP", "NEAR-USDT-SWAP",
 ]
 
-BINANCE_DIR = Path("/teamspace/studios/this_studio/v7/data/snapshots")
+# Pilot universe window (ROADMAP Phase 4)
+START_TS = 1689866400000  # 2023-07-20T15:20:00Z
+END_TS = 1784474400000    # 2026-07-19T15:20:00Z
+
+SNAPSHOT_BASE = Path("data/snapshots")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -105,9 +111,10 @@ def run_evidence(seed: int = 42) -> dict:
     # ---- 1. Load snapshots ----
     inputs: list[EventInput] = []
     for sym in PILOT_SYMBOLS:
-        snap_dir = BINANCE_DIR / f"binance-{sym.lower()}-5m-1689866400000-1784474400000"
+        dirname = f"okx-{sym.lower()}-5m-{START_TS}-{END_TS}"
+        snap_dir = SNAPSHOT_BASE / dirname
         if not snap_dir.exists():
-            print(f"SKIP {sym}: snapshot not found", file=sys.stderr)
+            print(f"SKIP {sym}: snapshot not found at {snap_dir}", file=sys.stderr)
             continue
         snap = load(snap_dir, allow_mark_gaps=True)
         inputs.append(EventInput(
@@ -175,7 +182,7 @@ def run_evidence(seed: int = 42) -> dict:
     print("EVIDENCE — FIRST FALSIFIABLE HYPOTHESIS (ROADMAP Phase 6)")
     print("=" * 72)
     print(f"\n{HYPOTHESIS}\n")
-    print(f"Data: Binance USD-M perpetuals, 5m bars")
+    print(f"Data: OKX USD-M perpetual swaps, 5m bars")
     print(f"Window: 2023-07-20 – 2026-07-19 (3 years)")
     print(f"Symbols: {len(inputs)} ({', '.join(PILOT_SYMBOLS[:len(inputs)])})")
     print(f"Setup: k_stop={HUNTER_SPEC.k_stop}, reward_risk={HUNTER_SPEC.reward_risk}, max_hold={HUNTER_SPEC.max_holding_bars} bars (24h)")
